@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package safeguard.upload.v1;
+
+message InitUploadRequest {
+  string agent_id = 1;
+  string agent_token = 2;
+  string file_hash = 3;
+  int64 file_size = 4;
+  int32 total_chunks = 5;
+  string file_name = 6;
+  string file_type = 7;
+  string file_path = 8;
+  string priority = 9;
+}
+
+message InitUploadResponse {
+  string status = 1;
+  string session_id = 2;
+  string file_id = 3;
+  repeated int32 uploaded_chunks = 4;
+}
+
+message UploadChunkRequest {
+  string session_id = 1;
+  int32 index = 2;
+  bytes content = 3;
+  string chunk_sha256 = 4;
+}
+
+message UploadChunksResponse {
+  string status = 1;
+  string session_id = 2;
+  repeated int32 uploaded_chunks = 3;
+}
+
+message UploadStatusRequest {
+  string session_id = 1;
+}
+
+message UploadStatusResponse {
+  string session_id = 1;
+  string status = 2;
+  repeated int32 uploaded_chunks = 3;
+  int32 total_chunks = 4;
+}
+
+message CompleteUploadRequest {
+  string session_id = 1;
+  string priority = 2;
+}
+
+message CompleteUploadResponse {
+  string status = 1;
+  string session_id = 2;
+  string file_hash = 3;
+  string task_id = 4;
+}
+
+service UploadService {
+  rpc InitUpload(InitUploadRequest) returns (InitUploadResponse);
+  rpc UploadChunks(stream UploadChunkRequest) returns (UploadChunksResponse);
+  rpc GetUploadStatus(UploadStatusRequest) returns (UploadStatusResponse);
+  rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
+}

@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: safeguard-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: safeguard
+      POSTGRES_USER: safeguard
+      POSTGRES_PASSWORD: safeguard
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    container_name: safeguard-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+
+  minio:
+    image: minio/minio:latest
+    container_name: safeguard-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

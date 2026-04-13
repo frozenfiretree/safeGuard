@@ -1,0 +1,16 @@
+[Unit]
+Description=SafeGuard OCR Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/safeguard/server
+EnvironmentFile=/etc/safeguard/server.env
+ExecStart=/opt/conda/envs/scanocr/bin/uvicorn ocr_service:app --host 127.0.0.1 --port 8010 --workers 1
+Restart=always
+RestartSec=5
+User=safeguard
+Group=safeguard
+
+[Install]
+WantedBy=multi-user.target

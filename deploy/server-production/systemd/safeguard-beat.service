@@ -1,0 +1,16 @@
+[Unit]
+Description=SafeGuard Celery Beat
+After=network.target redis.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/safeguard/server
+EnvironmentFile=/etc/safeguard/server.env
+ExecStart=/opt/conda/envs/scanocr/bin/celery -A tasks.celery_app beat --loglevel=INFO
+Restart=always
+RestartSec=5
+User=safeguard
+Group=safeguard
+
+[Install]
+WantedBy=multi-user.target
