@@ -25,6 +25,7 @@ from config_app import (
     FileDetectionStatus,
     NON_SENSITIVE_TTL_SECONDS,
     UPGRADE_STORE_DIR,
+    setup_app_logger,
 )
 from detection.pipeline import detect_file
 from models import (
@@ -42,6 +43,9 @@ from models import (
 from path_utils import remote_path_name
 from storage import db_session, init_db, object_storage, redis_cache
 from tracked_files import archive_sensitive_file, ingest_tracked_event
+
+
+logger = setup_app_logger("services")
 
 
 def _now() -> float:
@@ -331,6 +335,7 @@ def heartbeat(agent_id: str, payload: dict) -> dict:
 
 
 def init_upload_session(payload: dict) -> dict:
+    archive_after_commit = None
     with db_session() as session:
         file_row = session.get(FileRecord, payload["file_hash"])
         if file_row and file_row.detection_status != FileDetectionStatus.PARSE_FAILED.value:
@@ -346,36 +351,46 @@ def init_upload_session(payload: dict) -> dict:
                     file_hash=payload["file_hash"],
                     is_current=True,
                 ))
-            return {"status": "dedup", "file_id": payload["file_hash"], "uploaded_chunks": []}
+            if file_row.is_sensitive:
+                archive_after_commit = (payload["file_hash"], payload["agent_id"], payload["file_path"])
+            result = {"status": "dedup", "file_id": payload["file_hash"], "uploaded_chunks": []}
+        else:
+            existing = session.query(UploadSession).filter(
+                UploadSession.file_hash == payload["file_hash"],
+                UploadSession.status.in_([UploadSessionStatus.CREATED.value, UploadSessionStatus.UPLOADING.value]),
+                UploadSession.expires_at > _now(),
+            ).first()
+            if existing:
+                result = {
+                    "status": "existing",
+                    "session_id": existing.session_id,
+                    "uploaded_chunks": list(existing.uploaded_chunks or []),
+                }
+            else:
+                session_id = str(uuid.uuid4())
+                row = UploadSession(
+                    session_id=session_id,
+                    agent_id=payload["agent_id"],
+                    file_hash=payload["file_hash"],
+                    file_name=payload["file_name"],
+                    file_type=payload.get("file_type"),
+                    file_path=payload["file_path"],
+                    file_size=int(payload["file_size"]),
+                    total_chunks=int(payload["total_chunks"]),
+                    uploaded_chunks=[],
+                    status=UploadSessionStatus.CREATED.value,
+                    expires_at=_now() + UPLOAD_SESSION_TTL_SECONDS,
+                )
+                session.add(row)
+                result = {"status": "created", "session_id": session_id, "uploaded_chunks": []}
 
-        existing = session.query(UploadSession).filter(
-            UploadSession.file_hash == payload["file_hash"],
-            UploadSession.status.in_([UploadSessionStatus.CREATED.value, UploadSessionStatus.UPLOADING.value]),
-            UploadSession.expires_at > _now(),
-        ).first()
-        if existing:
-            return {
-                "status": "existing",
-                "session_id": existing.session_id,
-                "uploaded_chunks": list(existing.uploaded_chunks or []),
-            }
-
-        session_id = str(uuid.uuid4())
-        row = UploadSession(
-            session_id=session_id,
-            agent_id=payload["agent_id"],
-            file_hash=payload["file_hash"],
-            file_name=payload["file_name"],
-            file_type=payload.get("file_type"),
-            file_path=payload["file_path"],
-            file_size=int(payload["file_size"]),
-            total_chunks=int(payload["total_chunks"]),
-            uploaded_chunks=[],
-            status=UploadSessionStatus.CREATED.value,
-            expires_at=_now() + UPLOAD_SESSION_TTL_SECONDS,
-        )
-        session.add(row)
-        return {"status": "created", "session_id": session_id, "uploaded_chunks": []}
+    if archive_after_commit:
+        file_hash, agent_id, file_path = archive_after_commit
+        try:
+            archive_sensitive_file(file_hash, agent_id=agent_id, file_path=file_path)
+        except Exception as exc:
+            logger.warning("dedup sensitive archive failed: file_hash=%s agent_id=%s path=%s error=%s", file_hash, agent_id, file_path, exc)
+    return result
 
 
 def upload_chunk(session_id: str, index: int, body: bytes, content_md5: Optional[str] = None, chunk_sha256: Optional[str] = None) -> dict:
@@ -502,6 +517,11 @@ def run_discovery_pipeline(file_hash: str) -> dict:
             FileDetectionStatus.NON_SENSITIVE.value,
             FileDetectionStatus.PARSE_FAILED.value,
         }:
+            if file_row.detection_status == FileDetectionStatus.SENSITIVE.value:
+                try:
+                    archive_sensitive_file(file_hash)
+                except Exception as exc:
+                    logger.warning("sensitive archive backfill failed: file_hash=%s error=%s", file_hash, exc)
             return {"status": "skipped", "file_hash": file_hash, "detection_status": file_row.detection_status}
 
         file_row.detection_status = FileDetectionStatus.PARSING.value

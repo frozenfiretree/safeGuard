@@ -377,7 +377,8 @@ def archive_sensitive_file(file_hash: str, agent_id: Optional[str] = None, file_
 def _archive_sensitive_row(session, file_row: FileRecord, parse_row: Optional[ParseResult], agent_id: str, path: str, event_type: str, event_time: Optional[float]) -> dict:
     event_time = float(event_time or _now())
     name = remote_path_name(path or file_row.file_name, file_row.file_hash)
-    tracked = _find_tracked(session, agent_id, path=path, content_hash=file_row.file_hash)
+    content_hash_lookup = None if event_type == "initial" else file_row.file_hash
+    tracked = _find_tracked(session, agent_id, path=path, content_hash=content_hash_lookup)
     if not tracked:
         tracked = TrackedFile(
             tracked_file_id=str(uuid.uuid4()),
@@ -673,7 +674,7 @@ def backfill_sensitive_archives(agent_id: Optional[str] = None, limit: int = 50)
             query = query.filter(FileVersion.agent_id == agent_id)
         rows = query.limit(limit).all()
         for row in rows:
-            if _find_tracked(session, row.agent_id, path=row.file_path, content_hash=row.file_hash):
+            if _find_tracked(session, row.agent_id, path=row.file_path):
                 continue
             file_row = session.get(FileRecord, row.file_hash)
             parse_row = session.get(ParseResult, row.file_hash)
