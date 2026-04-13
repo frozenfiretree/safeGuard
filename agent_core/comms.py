@@ -125,7 +125,13 @@ class ServerClient:
         token = self.store.get_state("token")
         if not token:
             raise RuntimeError("agent token missing")
-        with grpc.insecure_channel(self.grpc_target) as channel:
+        with grpc.insecure_channel(
+            self.grpc_target,
+            options=[
+                ("grpc.max_send_message_length", 64 * 1024 * 1024),
+                ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+            ],
+        ) as channel:
             stub = safeguard_upload_pb2_grpc.UploadServiceStub(channel)
             init_resp = stub.InitUpload(
                 safeguard_upload_pb2.InitUploadRequest(

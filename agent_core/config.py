@@ -104,7 +104,7 @@ class AgentRuntimeConfig:
     move_pair_window_seconds: float = 2.0
     upload_workers: int = 2
     queue_batch_size: int = 20
-    chunk_size_bytes: int = 4 * 1024 * 1024
+    chunk_size_bytes: int = 3 * 1024 * 1024
     event_batch_size: int = 50
     max_retries: int = 5
     usb_poll_interval: int = 30
@@ -332,7 +332,7 @@ def parse_runtime_config(config_data: dict | None) -> AgentRuntimeConfig:
         move_pair_window_seconds=float(config_data.get("move_pair_window_seconds") or 2.0),
         queue_batch_size=int(config_data.get("queue_batch_size") or 20),
         event_batch_size=int(config_data.get("event_batch_size") or 50),
-        chunk_size_bytes=int(config_data.get("chunk_size_bytes") or 4 * 1024 * 1024),
+        chunk_size_bytes=int(config_data.get("chunk_size_bytes") or 3 * 1024 * 1024),
         upload_workers=int(config_data.get("upload_workers") or 2),
         usb_poll_interval=int(config_data.get("usb_poll_interval_sec") or 30),
         request_timeout=int(config_data.get("request_timeout_sec") or 20),

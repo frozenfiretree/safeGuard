@@ -10,6 +10,7 @@ from tasks import submit_discovery_task
 
 
 logger = setup_app_logger("grpc_upload")
+GRPC_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
 
 def _grpc_error(code: grpc.StatusCode, message: str):
@@ -89,7 +90,13 @@ class UploadServiceServicer(safeguard_upload_pb2_grpc.UploadServiceServicer):
 
 
 def build_grpc_server() -> grpc.Server:
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=8),
+        options=[
+            ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_BYTES),
+            ("grpc.max_send_message_length", GRPC_MAX_MESSAGE_BYTES),
+        ],
+    )
     safeguard_upload_pb2_grpc.add_UploadServiceServicer_to_server(UploadServiceServicer(), server)
     server.add_insecure_port(f"{GRPC_UPLOAD_HOST}:{GRPC_UPLOAD_PORT}")
     return server
