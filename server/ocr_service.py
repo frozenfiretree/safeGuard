@@ -75,6 +75,21 @@ def ensure_model_home() -> Path:
     return model_home
 
 
+def _local_ocr_model_kwargs(model_home: Path) -> dict:
+    return {
+        "text_detection_model_name": "PP-OCRv5_server_det",
+        "text_detection_model_dir": str(model_home / "PP-OCRv5_server_det"),
+        "text_recognition_model_name": "PP-OCRv5_server_rec",
+        "text_recognition_model_dir": str(model_home / "PP-OCRv5_server_rec"),
+        "textline_orientation_model_name": "PP-LCNet_x1_0_textline_ori",
+        "textline_orientation_model_dir": str(model_home / "PP-LCNet_x1_0_textline_ori"),
+        "doc_orientation_classify_model_name": "PP-LCNet_x1_0_doc_ori",
+        "doc_orientation_classify_model_dir": str(model_home / "PP-LCNet_x1_0_doc_ori"),
+        "doc_unwarping_model_name": "UVDoc",
+        "doc_unwarping_model_dir": str(model_home / "UVDoc"),
+    }
+
+
 def get_ocr_model():
     global OCR_MODEL
     global OCR_INIT_ERROR
@@ -109,26 +124,42 @@ def get_ocr_model():
     os.environ["FLAGS_minloglevel"] = "3"
 
     try:
-        ensure_model_home()
+        model_home = ensure_model_home()
         from paddleocr import PaddleOCR
 
+        local_models = _local_ocr_model_kwargs(model_home)
         base_constructors = [
-            {"use_textline_orientation": True, "lang": "ch", "enable_mkldnn": False},
-            {"use_angle_cls": True, "lang": "ch", "enable_mkldnn": False},
-            {"lang": "ch"},
+            {
+                **local_models,
+                "use_doc_orientation_classify": False,
+                "use_doc_unwarping": False,
+                "use_textline_orientation": False,
+                "lang": "ch",
+                "enable_mkldnn": False,
+            },
+            {
+                "use_doc_orientation_classify": False,
+                "use_doc_unwarping": False,
+                "use_textline_orientation": False,
+                "lang": "ch",
+                "enable_mkldnn": False,
+            },
+            {"lang": "ch", "enable_mkldnn": False},
         ]
         constructors = []
         for kwargs in base_constructors:
             if use_gpu:
                 constructors.append({**kwargs, "device": f"gpu:{gpu_id}"})
                 constructors.append({**kwargs, "use_gpu": True, "gpu_id": int(gpu_id) if gpu_id.isdigit() else 0})
+            constructors.append({**kwargs, "device": "cpu"})
+            constructors.append({**kwargs, "use_gpu": False})
             constructors.append(dict(kwargs))
         last_error: Optional[Exception] = None
         for kwargs in constructors:
             try:
                 OCR_MODEL = PaddleOCR(**kwargs)
                 OCR_INIT_ERROR = None
-                OCR_RUNTIME_DEVICE = "gpu" if ("device" in kwargs or "use_gpu" in kwargs) else "cpu"
+                OCR_RUNTIME_DEVICE = "gpu" if str(kwargs.get("device") or "").startswith("gpu") or kwargs.get("use_gpu") is True else "cpu"
                 logger.info("PaddleOCR initialized with args: %s, gpu_enabled=%s", sorted(kwargs.keys()), use_gpu)
                 return OCR_MODEL
             except TypeError as e:
@@ -137,8 +168,9 @@ def get_ocr_model():
             except Exception as e:
                 last_error = e
                 if "device" in kwargs or "use_gpu" in kwargs:
-                    logger.warning("PaddleOCR GPU initialization failed; trying CPU fallback: %s", e)
+                    logger.warning("PaddleOCR initialization failed; trying next constructor: %s", e)
                     os.environ["FLAGS_use_gpu"] = "0"
+                    os.environ["CUDA_VISIBLE_DEVICES"] = ""
                     continue
                 raise
         raise last_error or RuntimeError("PaddleOCR initialization failed")
