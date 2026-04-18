@@ -1,4 +1,5 @@
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -15,7 +16,22 @@ from storage import init_db
 logger = setup_app_logger()
 validate_production_settings()
 init_db()
-app = FastAPI(title="SafeGuard Server V2", version=APP_VERSION)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    init_db()
+    app.state.grpc_server = start_grpc_server()
+    logger.info("server v2 startup complete")
+    yield
+    # Shutdown
+    grpc_server = getattr(app.state, "grpc_server", None)
+    if grpc_server:
+        grpc_server.stop(grace=5)
+
+
+app = FastAPI(title="SafeGuard Server V2", version=APP_VERSION, lifespan=lifespan)
 BASE_DIR = Path(__file__).resolve().parent
 WEBUI_DIR = BASE_DIR / "webui"
 WEBUI_ASSETS_DIR = WEBUI_DIR / "assets"
@@ -28,20 +44,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def on_startup():
-    init_db()
-    app.state.grpc_server = start_grpc_server()
-    logger.info("server v2 startup complete")
-
-
-@app.on_event("shutdown")
-def on_shutdown():
-    grpc_server = getattr(app.state, "grpc_server", None)
-    if grpc_server:
-        grpc_server.stop(grace=5)
 
 
 @app.middleware("http")
