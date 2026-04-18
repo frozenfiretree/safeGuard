@@ -4,8 +4,10 @@ echo ============================================
 echo SafeGuard 安全监控系统
 echo ============================================
 echo.
+echo Python路径: D:\anaconda3\envs\scanocr\python.exe
+echo.
 
-conda activate scanocr
-python start_all.py
+:: 使用conda的Python
+D:\anaconda3\envs\scanocr\python.exe start_all.py
 
 pause
