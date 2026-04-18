@@ -59,9 +59,15 @@ app.include_router(rules_alias_router)
 if WEBUI_ASSETS_DIR.exists():
     app.mount("/assets", StaticFiles(directory=str(WEBUI_ASSETS_DIR)), name="assets")
 
+STATIC_DIR = WEBUI_DIR / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
 
 @app.get("/")
 def serve_webui_index():
     if WEBUI_INDEX.exists():
         return FileResponse(str(WEBUI_INDEX))
     return {"status": "ok", "version": APP_VERSION}
+
+

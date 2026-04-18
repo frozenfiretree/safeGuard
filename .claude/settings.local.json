@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(unzip -l static.zip)",
+      "Bash(mkdir -p /d/work/safeGuard/reference)",
+      "Bash(unzip -o static.zip -d /d/work/safeGuard/reference)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(rm -rf /d/work/safeGuard/server/webui/*)",
+      "Bash(cp -r /d/work/safeGuard/frontend/dist/* /d/work/safeGuard/server/webui/)",
+      "Bash(python3)",
+      "Bash(python3 -c ' *)",
+      "Bash(python -c \"import main; print\\('Python import OK'\\)\")",
+      "Bash(conda activate *)",
+      "Bash(python -c \"import server.main\")",
+      "Bash(git add *)"
+    ]
+  }
+}

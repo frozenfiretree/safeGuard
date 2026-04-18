@@ -1,0 +1,1660 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+    <!-- 修改前: <meta name="viewport" content="width=device-width, initial-scale=1.0"> -->
+
+  <!-- 修改后: 强制禁止缩放配置 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+
+  <meta name="referrer" content="no-referrer" />
+  <title>敏感信息态势感知大屏</title>
+  <!-- 引入资源 -->
+  <link href="/static/css/all.min.css" rel="stylesheet">
+  <script src="/static/js/echarts.js"></script>
+
+  <style>
+      /* --- 1. 强制重置所有元素的边距 --- */
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    /* --- 2. 这里的关键是把 html 也设为黑色 --- */
+    html {
+      background-color: #050a15; /* 如果 body 被顶下来，这里也是黑的，肉眼就看不出白条了 */
+      height: 100%;
+      overflow: hidden; /* 防止出现双滚动条 */
+    }
+
+    /* --- 3. Body 样式修正 --- */
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      color: var(--text-main);
+      height: 100vh;
+      width: 100vw;       /* 强制占满宽 */
+      margin: 0;          /* 再次强调 */
+      padding: 0;         /* 再次强调 */
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background-color: #050a15;
+      position: relative;
+    }
+      /* --- 新增：背景流光动画定义 --- */
+    @keyframes gradientAnimation {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+
+    /* --- 1. 核心主题配色 (深空蓝 + 荧光青) --- */
+    :root {
+      --bg-core: #050a15;
+      --bg-panel: rgba(16, 36, 66, 0.5); /* 玻璃质感背景 */
+      --primary: #00f0ff; /* 核心亮色 (青) */
+      --accent: #0070cc;  /* 辅助深蓝 */
+      --text-main: #e0f7ff;
+      --text-muted: #648db3;
+      --danger: #ff3333;
+      --warning: #f59e0b;
+      --success: #00ffaa;
+      --border-glow: 0 0 10px rgba(0, 240, 255, 0.2);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+       /* --- 1. 新增：流光动画定义 (S级特效核心) --- */
+    @keyframes gradientAnimation {
+      0% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+      100% { background-position: 0% 50%; }
+    }
+
+    /* --- 2. 修改后的 body 样式 (S级深空流光背景) --- */
+    /* =================================================================
+       第一步：修改 Body 和新增 Canvas 样式
+       ================================================================= */
+
+    /* 1. 重置 Body，设为纯深色背景，作为 Canvas 的容器 */
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      color: var(--text-main);
+      height: 100vh;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background-color: #050a15; /* 核心深底色 */
+      position: relative;        /* 关键：确保子元素定位正确 */
+    }
+
+    /* 2. 新增：背景画布样式 (置于最底层) */
+    #particle-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 0;             /* 层级：0 */
+      pointer-events: auto;   /* 允许鼠标交互 */
+      display: block;
+    }
+
+    /* 3. 调整 Header 和 Main 的层级，确保它们浮在画布之上 */
+    .header, .main-container {
+      position: relative;
+      z-index: 10;            /* 层级：10，保证在画布上面 */
+    }
+
+    /* 4. 优化面板背景，增加通透感，让背后的粒子若隐若现 */
+    .panel {
+      background: rgba(12, 24, 46, 0.45); /* 稍微降低不透明度 */
+      backdrop-filter: blur(8px);         /* 磨砂玻璃效果 */
+      -webkit-backdrop-filter: blur(8px);
+      border: 1px solid rgba(0, 240, 255, 0.2);
+      box-shadow: inset 0 0 30px rgba(0, 240, 255, 0.05); /* 内发光 */
+      position: relative;
+      display: flex;
+      flex-direction: column;
+    }
+
+
+
+    /* --- 2. 顶部导航栏 --- */
+        .header {
+      height: 70px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0 20px;
+      /* 修改：加深背景，增加可读性 */
+      background: linear-gradient(to bottom, rgba(10, 21, 37, 0.95), rgba(10, 21, 37, 0.4));
+      border-bottom: 1px solid rgba(0, 240, 255, 0.3);
+      position: relative;
+      z-index: 10;
+    }
+
+    .header::after { /* 底部发光线条 */
+      content: ''; position: absolute; bottom: -1px; left: 0; width: 100%; height: 1px;
+      box-shadow: 0 0 10px var(--primary);
+    }
+
+    /* 修改后的 .brand 样式 */
+    .brand {
+      position: absolute;       /* 绝对定位 */
+      left: 50%;                /*以此为基准居中 */
+      transform: translateX(-50%); /* 修正自身的宽度偏移 */
+
+      font-size: 32px;          /* 增大字体 (原24px) */
+      font-weight: 800;         /*以此加粗 */
+      letter-spacing: 4px;      /* 增加字间距，更有科技感 */
+
+      /* 颜色与发光增强 */
+      color: #ffffff;
+      text-shadow:
+        0 0 10px var(--primary),
+        0 0 20px var(--primary),
+        0 0 40px var(--accent); /* 多层光晕使其更显眼 */
+
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      z-index: 20;              /* 确保层级最高 */
+      white-space: nowrap;      /* 防止换行 */
+    }
+
+    /* --- 3. 布局网格 --- */
+    .main-container { flex: 1; padding: 20px; display: flex; gap: 20px; overflow: hidden; position: relative; }
+
+    .view-section { display: none; width: 100%; height: 100%; flex-direction: column; gap: 20px; }
+    .view-section.active { display: flex; }
+
+    /* 通用面板样式 */
+        /* 通用面板样式 */
+    .panel {
+      /* 修改：更通透的背景 + 磨砂玻璃特效 */
+      background: rgba(16, 36, 66, 0.35);
+      backdrop-filter: blur(12px);        /* 关键：磨砂模糊 */
+      -webkit-backdrop-filter: blur(12px);
+
+      border: 1px solid rgba(0, 240, 255, 0.2);
+      box-shadow: inset 0 0 20px rgba(0, 240, 255, 0.05);
+      position: relative;
+      display: flex; flex-direction: column;
+    }
+
+    /* 面板角落装饰 (四角光标) */
+    .panel::before { content: ''; position: absolute; top: -1px; left: -1px; width: 10px; height: 10px; border-top: 2px solid var(--primary); border-left: 2px solid var(--primary); }
+    .panel::after { content: ''; position: absolute; top: -1px; right: -1px; width: 10px; height: 10px; border-top: 2px solid var(--primary); border-right: 2px solid var(--primary); }
+    .panel-corner-btm { position: absolute; bottom: -1px; right: -1px; width: 10px; height: 10px; border-bottom: 2px solid var(--primary); border-right: 2px solid var(--primary); }
+
+    .panel-head {
+      padding: 10px 15px; background: rgba(0, 240, 255, 0.05); border-bottom: 1px solid rgba(255,255,255,0.1);
+      font-size: 1rem; color: var(--text-main); font-weight: 600; display: flex; justify-content: space-between; align-items: center;
+    }
+    .panel-body { flex: 1; padding: 15px; overflow: hidden; position: relative; }
+
+    /* --- 4. 首页总览模块 (Dashboard) --- */
+
+    /* 顶部 4个核心指标卡片 */
+    .stats-row {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; height: 140px;
+    }
+
+    .stat-card {
+      background: rgba(0, 0, 0, 0.3);
+      display: flex; align-items: center; padding: 0 20px; gap: 20px;
+      border: 1px solid rgba(255,255,255,0.05);
+      position: relative; transition: transform 0.3s;
+    }
+    .stat-card:hover { transform: translateY(-5px); border-color: var(--primary); box-shadow: 0 5px 15px rgba(0,240,255,0.1); }
+
+    .stat-icon {
+      width: 60px; height: 60px; border-radius: 50%; display: flex; justify-content: center; align-items: center;
+      font-size: 1.8rem; background: rgba(255,255,255,0.05); color: var(--primary);
+      box-shadow: 0 0 15px rgba(0, 240, 255, 0.2);
+    }
+    .stat-info { flex: 1; display: flex; flex-direction: column; justify-content: center; }
+    .stat-label { font-size: 0.9rem; color: var(--text-muted); margin-bottom: 5px; }
+    .stat-value { font-size: 2rem; font-weight: bold; color: #fff; font-family: 'Arial', sans-serif; text-shadow: 0 0 10px rgba(255,255,255,0.3); }
+    .stat-sub { font-size: 0.8rem; color: var(--text-muted); display: flex; align-items: center; gap: 5px; margin-top: 5px;}
+    .trend-up { color: var(--danger); }
+    .trend-down { color: var(--success); }
+
+    /* 安全指数 特殊样式 */
+    .safety-index-val { color: var(--success); text-shadow: 0 0 15px var(--success); }
+    .risk-high { color: var(--danger); text-shadow: 0 0 10px var(--danger); }
+    .risk-mid { color: var(--warning); text-shadow: 0 0 10px var(--warning); }
+    .risk-low { color: var(--success); text-shadow: 0 0 10px var(--success); }
+
+        /* --- 中间图表区域 (改为 1:2:1，中间地图变宽) --- */
+    .charts-row {
+      flex: 1; display: grid; grid-template-columns: 1fr 2fr 1fr; gap: 20px; min-height: 0;
+    }
+
+        /* --- 底部区域 (改为 4列) --- */
+    /* 顺序：日志(1.2) | 文件风险(1) | 设备(1) | 操作(0.5) */
+    .bottom-row {
+      height: 200px;
+      display: grid;
+      grid-template-columns: 1.2fr 1fr 1fr 0.5fr;
+      gap: 20px;
+    }
+
+
+/* --- 优化：实时日志悬停交互 --- */
+
+    /* 1. 鼠标悬停在列表上时，暂停滚动，方便用户操作 */
+    .log-list:hover {
+      animation-play-state: paused;
+    }
+
+    /* 2. 必须给列表项加相对定位，作为展开内容的基准 */
+    .log-item {
+      position: relative; /* 关键 */
+      /* 其他原有样式保持不变... */
+    }
+
+    /* 3. 日志内容文本的基础样式 */
+    .log-msg {
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--text-main);
+      padding: 0 5px;
+      border-radius: 2px;
+      cursor: help; /* 鼠标变成问号，提示可查看 */
+      transition: all 0.2s;
+    }
+
+    /* 4. 核心：鼠标悬停时“展开”显示完整内容 */
+    .log-msg:hover {
+      position: absolute;       /* 脱离文档流 */
+      left: 120px;              /* 避开左侧的时间和标签(根据实际宽度调整) */
+      right: 10px;              /* 靠右对齐 */
+      top: 5px;
+
+      background: rgba(5, 10, 21, 0.98); /* 深色背景遮挡底部文字 */
+      border: 1px solid var(--primary);  /* 高亮边框 */
+      box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+
+      white-space: normal;      /* 允许换行 */
+      overflow: visible;        /* 显示全部 */
+      z-index: 100;             /* 层级最高 */
+
+      padding: 8px;
+      line-height: 1.4;
+      height: auto;             /* 高度自适应 */
+      min-height: 100%;
+    }
+    /* 滚动日志 */
+    .log-container { height: 100%; overflow: hidden; position: relative; }
+    .log-list { list-style: none; position: absolute; width: 100%; animation: scrollUp 30s linear infinite; }
+    .log-item {
+      padding: 8px 0; border-bottom: 1px dashed rgba(255,255,255,0.1); font-size: 0.85rem; display: flex; align-items: center;
+    }
+    /* 修改：增加不换行和禁止压缩属性 */
+    .log-tag {
+  padding: 2px 8px;        /* 左右内边距稍微加大，显得更像长条 */
+  border-radius: 2px;
+  font-size: 0.7rem;
+  margin-right: 10px;
+  background: rgba(255,255,255,0.1);
+
+  /* --- 核心修改 --- */
+  white-space: nowrap;     /* 1. 强制文字不换行 */
+  display: inline-block;   /* 2. 保持块状特性 */
+  min-width: 60px;         /* 3. 设置一个最小宽度，保证它看起来是长条形的 */
+  text-align: center;      /* 4. 文字居中 */
+  flex-shrink: 0;          /* 5. 关键：禁止在 Flex 布局中被挤扁 */
+}
+    .log-tag.alert { background: rgba(255, 51, 51, 0.2); color: var(--danger); border: 1px solid var(--danger); }
+
+    @keyframes scrollUp { 0% { transform: translateY(0); } 100% { transform: translateY(-100%); } }
+
+    /* 地图模块动画 */
+    @keyframes blinker { 50% { opacity: 0; } }
+
+    /* --- 辅助类 --- */
+    .hidden { display: none !important; }
+
+    /* 表格样式 */
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th { text-align: left; padding: 12px; color: var(--text-muted); border-bottom: 2px solid rgba(255,255,255,0.1); }
+    td { padding: 12px; border-bottom: 1px solid rgba(255,255,255,0.05); color: var(--text-main); }
+    tr:hover { background: rgba(0, 240, 255, 0.05); }
+/* --- 新增：左侧监控天数模块样式 --- */
+  /* --- 修改后的：高科技感监控模块 (放大版) --- */
+    .monitor-box {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 15px; /* 间距拉大 */
+      /* 背景保持不变 */
+      background: linear-gradient(90deg, rgba(0, 240, 255, 0.15) 0%, rgba(0, 240, 255, 0.02) 80%, transparent 100%);
+      border-left: 4px solid var(--primary); /* 边框变粗 */
+
+      /* --- 修改点：内边距放大 --- */
+      padding: 8px 25px 8px 15px;
+      margin-right: 30px; /* 右侧留白增加 */
+
+      clip-path: polygon(0 0, 100% 0, 95% 100%, 0% 100%);
+      overflow: hidden;
+    }
+
+    /* 扫描光效动画 (保持不变) */
+    .monitor-box::after {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: -100%;
+      width: 50%;
+      height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+      transform: skewX(-20deg);
+      animation: scanLight 4s infinite linear;
+    }
+
+    @keyframes scanLight {
+      0% { left: -100%; }
+      50% { left: 200%; }
+      100% { left: 200%; }
+    }
+
+    /* 图标区域 (放大) */
+    .monitor-icon-box {
+      /* --- 修改点：尺寸放大 --- */
+      width: 46px;  /* 原 36px */
+      height: 46px; /* 原 36px */
+
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      background: rgba(0, 240, 255, 0.1);
+      border: 1px solid rgba(0, 240, 255, 0.3);
+      border-radius: 4px;
+      box-shadow: 0 0 15px rgba(0, 240, 255, 0.25); /* 阴影增强 */
+    }
+
+    .monitor-icon-box i {
+      /* --- 修改点：图标放大 --- */
+      font-size: 1.6rem; /* 原 1.2rem */
+      color: var(--success);
+      animation: pulseShield 2s infinite ease-in-out;
+    }
+
+    @keyframes pulseShield {
+      0% { text-shadow: 0 0 5px var(--success); opacity: 0.8; }
+      50% { text-shadow: 0 0 25px var(--success), 0 0 10px #fff; opacity: 1; }
+      100% { text-shadow: 0 0 5px var(--success); opacity: 0.8; }
+    }
+
+    .monitor-text-col {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      z-index: 1;
+    }
+
+    /* 数字样式 (放大) */
+    .monitor-num {
+      font-family: 'Segoe UI', 'Roboto', sans-serif;
+      /* --- 修改点：字体大幅加大 --- */
+      font-size: 2.2rem; /* 原 1.6rem */
+
+      color: #fff;
+      font-weight: 800;
+      line-height: 0.9; /* 稍微压低行高，防止撑破 Header */
+      text-shadow: 0 0 15px var(--primary); /* 发光增强 */
+      letter-spacing: 1px;
+    }
+
+    /* 标签样式 (放大) */
+    .monitor-label {
+      /* --- 修改点：字体微调 --- */
+      font-size: 0.75rem; /* 原 0.65rem */
+
+      color: var(--primary);
+      opacity: 0.9;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      margin-top: 4px; /* 间距微调 */
+      font-weight: 600;
+    }
+
+    /* --- 修改：标题区域样式 (支持两行文字) --- */
+    /* 覆盖之前的 .brand 样式，保持绝对居中，但改为纵向排列 */
+    .brand {
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      z-index: 20;
+    }
+
+    /* 文字列容器 */
+    .brand-text-col {
+      display: flex;
+      flex-direction: column; /* 垂直排列 */
+      align-items: center;    /* 文字居中对齐 */
+    }
+
+    /* 顶部小标题：资阳电网 */
+    .org-title {
+      font-size: 16px;
+      color: var(--text-muted);
+      letter-spacing: 8px; /* 字间距拉大，显得高级 */
+      font-weight: 600;
+      margin-bottom: 4px;  /* 与主标题的间距 */
+      text-transform: uppercase;
+      text-shadow: none; /* 小字不发光，保持清晰 */
+    }
+
+    /* 主标题：系统名称 */
+    .sys-title {
+      font-size: 30px;
+      font-weight: 800;
+      color: #fff;
+      letter-spacing: 3px;
+      text-shadow: 0 0 10px var(--primary), 0 0 20px var(--accent);
+      white-space: nowrap;
+      line-height: 1;
+    }
+      /* --- 优化后的风险操作数模块样式 --- */
+    /* 1. 容器：占满高度，纵向排列 */
+    .risk-list-box {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 12px; /* 卡片之间的间距 */
+      padding: 15px;
+    }
+
+    /* 2. 单个卡片：关键是 flex: 1 让它自动撑满剩余空间，消灭空隙 */
+    .risk-item {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      padding: 0 20px;
+      border-radius: 6px;
+      position: relative;
+      overflow: hidden;
+      /* 玻璃质感背景 */
+      backdrop-filter: blur(5px);
+      transition: all 0.3s;
+      border: 1px solid rgba(255,255,255,0.05);
+    }
+
+    /* 悬停微交互 */
+    .risk-item:hover {
+      transform: translateX(5px);
+      filter: brightness(1.2);
+    }
+
+    /* --- 三种等级的特定配色 (渐变填充) --- */
+    .risk-item.type-high {
+      background: linear-gradient(to right, rgba(255, 51, 51, 0.15), rgba(255, 51, 51, 0.05));
+      border-left: 4px solid var(--danger);
+    }
+    .risk-item.type-mid {
+      background: linear-gradient(to right, rgba(245, 158, 11, 0.15), rgba(245, 158, 11, 0.05));
+      border-left: 4px solid var(--warning);
+    }
+    .risk-item.type-low {
+      background: linear-gradient(to right, rgba(0, 255, 170, 0.15), rgba(0, 255, 170, 0.05));
+      border-left: 4px solid var(--success);
+    }
+
+    /* --- 内部元素布局 --- */
+    /* 图标圆圈 */
+    .risk-icon {
+      width: 46px;
+      height: 46px;
+      border-radius: 50%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      margin-right: 15px;
+      background: rgba(0,0,0,0.2);
+      font-size: 1.3rem;
+      box-shadow: 0 0 15px rgba(0,0,0,0.1);
+    }
+    /* 图标颜色 */
+    .type-high .risk-icon { color: var(--danger); border: 1px solid rgba(255, 51, 51, 0.3); }
+    .type-mid .risk-icon { color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+    .type-low .risk-icon { color: var(--success); border: 1px solid rgba(0, 255, 170, 0.3); }
+
+    /* 文字区域 */
+    .risk-text { flex: 1; display: flex; flex-direction: column; justify-content: center; }
+    .risk-title { font-size: 1.25rem; color: #fff; font-weight: 600; letter-spacing: 1px; }
+    .risk-sub { font-size: 1rem; color: rgba(255,255,255,0.5); text-transform: uppercase; margin-top: 4px; }
+
+    /* 数字区域 (大号字体) */
+    .risk-val-box { font-size: 2.2rem; font-weight: 800; font-family: 'Segoe UI', sans-serif; }
+      /* --- 新增：弹窗样式 --- */
+    .modal-overlay {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0, 0, 0, 0.85); z-index: 9999;
+      display: flex; justify-content: center; align-items: center;
+      backdrop-filter: blur(8px);
+    }
+    .modal-box {
+      width: 500px;
+      background: rgba(20, 10, 10, 0.95);
+      border: 2px solid var(--danger);
+      box-shadow: 0 0 50px rgba(255, 51, 51, 0.6), inset 0 0 20px rgba(255, 51, 51, 0.2);
+      border-radius: 6px;
+      text-align: center;
+      animation: alertPop 0.5s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+      overflow: hidden;
+    }
+    .modal-header {
+      background: var(--danger);
+      color: #fff; padding: 15px; font-size: 1.4rem; font-weight: bold;
+      letter-spacing: 2px;
+      text-shadow: 0 2px 5px rgba(0,0,0,0.3);
+    }
+    .modal-content { padding: 30px 20px; }
+    .modal-msg-text {
+      color: #fff; font-size: 1.2rem; line-height: 1.6; margin-bottom: 15px;
+    }
+    .modal-msg-highlight { color: var(--danger); font-weight: bold; font-size: 1.3rem; margin: 0 5px; }
+    .modal-time { color: #888; font-size: 0.9rem; font-family: monospace; }
+
+    .modal-footer { padding-bottom: 20px; }
+    .modal-btn {
+      background: transparent; border: 1px solid var(--danger); color: var(--danger);
+      padding: 8px 30px; cursor: pointer; font-size: 1rem; border-radius: 4px; transition: 0.3s;
+    }
+    .modal-btn:hover { background: var(--danger); color: #fff; box-shadow: 0 0 15px var(--danger); }
+
+    @keyframes alertPop { from { transform: scale(0.5); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  </style>
+</head>
+<body><canvas id="particle-canvas"></canvas>
+
+
+  <!-- 1. 顶部 Header -->
+  <header class="header">
+
+  <div style="display: flex; align-items: center;">
+      <div class="monitor-box">
+        <div class="monitor-icon-box">
+          <i class="fas fa-shield-alt"></i>
+        </div>
+
+        <div class="monitor-text-col">
+          <div class="monitor-num" id="safe-days-count">000</div>
+          <div class="monitor-label">系统安全运行（天）</div>
+        </div>
+      </div>
+    </div>
+
+
+    </div>
+
+ <div class="brand">
+
+
+      <div class="brand-text-col">
+        <div class="org-title">资阳电网</div>
+        <div class="sys-title">敏感信息检测溯源工具</div>
+      </div>
+    </div>
+
+    <div style="display: flex; align-items: center; gap: 15px;">
+      <button onclick="window.location.href='/system'"
+              style="background:rgba(0, 240, 255, 0.1); border:1px solid var(--primary); color:var(--primary); padding:6px 15px; cursor:pointer; font-size:0.85rem; border-radius:4px; transition:0.3s;">
+        <i class="fas fa-sign-in-alt"></i> 进入系统
+      </button>
+      <span id="sysTime" style="font-family: monospace; color: var(--primary);">12:00:00</span>
+      <button onclick="location.reload()" style="background:none; border:1px solid var(--primary); color:var(--primary); padding:5px 10px; cursor:pointer;">
+        <i class="fas fa-sync-alt"></i>
+      </button>
+    </div>
+
+  </header>
+
+  <!-- 2. 主体内容 -->
+  <main class="main-container">
+
+    <!-- 视图 A: 总览驾驶舱 (Dashboard) -->
+    <div id="dashboardView" class="view-section active">
+
+      <!-- 第一行：4个核心指标 -->
+      <div class="stats-row">
+        <!-- 模块1 -->
+        <div class="stat-card">
+          <div class="stat-icon"><i class="fas fa-bug"></i></div>
+          <div class="stat-info">
+            <div class="stat-label">敏感文件总数</div>
+            <div class="stat-value" id="val-sensitive-count">1,024</div>
+            <div class="stat-sub"><span class="trend-up"><i class="fas fa-arrow-up"></i> 12%</span> 较昨日</div>
+          </div>
+          <div class="panel-corner-btm"></div>
+        </div>
+
+        <!-- 模块2 -->
+        <div class="stat-card">
+          <div class="stat-icon" style="color: var(--warning);"><i class="fas fa-file-contract"></i></div>
+          <div class="stat-info">
+            <div class="stat-label">敏感文件泄露数</div>
+            <div class="stat-value" id="val-file-risk">15 <span style="font-size:1rem; color:#888;">/ 320</span></div>
+            <div class="stat-sub" style="color: var(--warning);">当前有 15 个文件未加密传输</div>
+          </div>
+          <div class="panel-corner-btm"></div>
+        </div>
+
+        <!-- 模块3 -->
+        <div class="stat-card">
+          <div class="stat-icon" style="color: var(--danger); border-color: var(--danger);"><i class="fas fa-radiation"></i></div>
+          <div class="stat-info">
+            <div class="stat-label">总体风险评级</div>
+            <div class="stat-value risk-mid" id="val-risk-level">中等风险</div>
+            <div class="stat-sub">建议检查财务部设备</div>
+          </div>
+          <div class="panel-corner-btm"></div>
+        </div>
+
+               <!-- 模块4 (换成了饼图) -->
+        <div class="stat-card" style="padding-right: 5px; position:relative;">
+          <!-- 注意：stat-card 默认是 flex 布局，放图表可能需要调整样式 -->
+          <div id="infoTypeChart" style="width: 100%; height: 100%; position: absolute; left: 0; top: 0;"></div>
+          <div class="panel-corner-btm"></div>
+        </div>
+
+      </div>
+
+            <!-- === 第二行：核心展示区 (部门 + 地图 + 风险指标) === -->
+      <div class="charts-row">
+
+        <!-- 1. 左侧: 部门风险排名 (原样保留) -->
+        <div class="panel">
+          <div class="panel-head">
+            <span><i class="fas fa-chart-bar"></i> 部门风险排名</span>
+            <small style="color:var(--text-muted)">Top 5 Risk Depts</small>
+          </div>
+          <div class="panel-body">
+            <div id="deptBarChart" style="width: 100%; height: 100%;"></div>
+          </div>
+          <div class="panel-corner-btm"></div>
+        </div>
+
+        <!-- 2. 中间: 实时检测定位 (移到C位，且宽度变大) -->
+        <div class="panel">
+          <div class="panel-head">
+            <span><i class="fas fa-location-arrow"></i> 实时检测定位</span>
+          </div>
+          <div class="panel-body" style="padding:0; position:relative;">
+            <div id="map-container" style="width: 100%; height: 100%;"></div>
+            <!-- 悬浮信息 -->
+            <div style="position: absolute; top: 10px; left: 10px; right: 10px; display: flex; justify-content: space-between; pointer-events: none; z-index: 10;">
+                <div style="background: rgba(12, 24, 46, 0.85); border: 1px solid rgba(64, 197, 241, 0.5); padding: 5px 10px; border-radius: 4px; backdrop-filter: blur(4px);">
+                    <div style="font-size: 10px; color: #aaa;">当前区域</div>
+                    <div id="region-name" style="font-size: 14px; font-weight: bold; color: #fff;">定位中...</div>
+                </div>
+                <div style="text-align: right; background: rgba(12, 24, 46, 0.85); border: 1px solid rgba(64, 197, 241, 0.5); padding: 5px 10px; border-radius: 4px; backdrop-filter: blur(4px);">
+                    <div style="font-size: 10px; color: #aaa;">设备信号 <span style="animation: blinker 1.5s linear infinite; color: #00ffaa;">●</span></div>
+                    <div id="coords" style="font-size: 14px; font-weight: bold; color: #fff;">SEARCHING</div>
+                </div>
+            </div>
+          </div>
+          <div class="panel-corner-btm"></div>
+        </div>
+
+        <!-- 3. 右侧: 新增 [风险操作数] 模块 -->
+        <div class="panel">
+          <div class="panel-head">
+            <span><i class="fas fa-exclamation-triangle"></i> 风险操作数</span>
+          </div>
+         <div class="panel-body" style="padding: 0;">
+<div class="risk-list-box">
+
+                <div class="risk-item type-high">
+                    <div class="risk-icon"><i class="fas fa-ban"></i></div>
+                    <div class="risk-text">
+                        <div class="risk-title">高风险阻断</div>
+                        <div class="risk-sub">
+                          <i class="fas fa-hdd" style="margin-right:3px;"></i> U盘拷贝 / 违规外联
+                        </div>
+                    </div>
+                    <div class="risk-val-box risk-high" style="color: var(--danger); text-shadow: 0 0 15px var(--danger);">0</div>
+                </div>
+
+                <div class="risk-item type-mid">
+                    <div class="risk-icon"><i class="fas fa-exclamation-triangle"></i></div>
+                    <div class="risk-text">
+                        <div class="risk-title">中风险预警</div>
+                        <div class="risk-sub">
+                            <i class="fas fa-save" style="margin-right:3px;"></i> 文件另存 / 修改
+                        </div>
+                    </div>
+                    <div class="risk-val-box risk-mid" style="color: var(--warning); text-shadow: 0 0 15px var(--warning);">0</div>
+                </div>
+
+                <div class="risk-item type-low">
+                    <div class="risk-icon"><i class="fas fa-clipboard-check"></i></div>
+                    <div class="risk-text">
+                        <div class="risk-title">低风险审计</div>
+                        <div class="risk-sub">
+                            <i class="fas fa-folder-open" style="margin-right:3px;"></i> 文件打开 / 预览 
+                        </div>
+                    </div>
+                    <div class="risk-val-box risk-low" style="color: var(--success); text-shadow: 0 0 15px var(--success);">0</div>
+                </div>
+
+             </div>
+          </div>
+          <div class="panel-corner-btm"></div>
+        </div>
+      </div>
+
+            <!-- === 第三行：底部数据 (扩展为4列) === -->
+      <div class="bottom-row">
+
+        <!-- 1. 左侧: 日志 (变窄保留) -->
+        <div class="panel">
+          <div class="panel-head"><span><i class="fas fa-history"></i> 实时违规审计日志</span></div>
+          <div class="panel-body">
+             <div class="log-container">
+               <ul class="log-list" id="realTimeLogs"></ul>
+             </div>
+          </div>
+        </div>
+
+        <!-- 2. 【新增模块】: 文件风险指数 (插在中间) -->
+    <div class="panel">
+          <div class="panel-head">
+            <span><i class="fas fa-file-medical-alt"></i> 文件风险排行 (Top 10)</span>
+          </div>
+
+          <div class="panel-body" style="padding: 10px 15px; display: flex; flex-direction: column; overflow: hidden; flex: 1;">
+
+             <div style="display: flex; justify-content: space-between; color: var(--text-muted); font-size: 0.8rem; padding-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.1); margin-bottom: 5px; flex-shrink: 0;">
+               <span>文件名</span>
+               <span>
+                   <span style="color:var(--danger)">高</span> /
+                   <span style="color:var(--warning)">中</span> /
+                   <span style="color:var(--success)">低</span>
+               </span>
+             </div>
+
+             <div class="risk-list-container" style="flex: 1; overflow: hidden; position: relative;">
+                <ul class="log-list" id="fileRiskList">
+                    </ul>
+             </div>
+          </div>
+          <div class="panel-corner-btm"></div>
+        </div>
+
+        <!-- 3. 中右: 违规设备总览 (保留) -->
+        <div class="panel">
+          <div class="panel-head">
+            <span><i class="fas fa-network-wired"></i> 违规设备总览</span>
+          </div>
+          <div class="panel-body" style="overflow-y: auto;">
+             <!-- ID 保持不变，JS 会自动填充 -->
+             <div style="display:grid; grid-template-columns: 1fr; gap:10px;" id="miniDeviceList"></div>
+          </div>
+          <div class="panel-corner-btm"></div>
+        </div>
+
+                      <!-- 4. 最右: 安全指数 (换到了这里) -->
+        <div class="panel">
+           <div class="panel-head">
+             <span><i class="fas fa-tachometer-alt"></i> 实时安全指数</span>
+           </div>
+           <div class="panel-body">
+              <div id="gaugeChart" style="width: 100%; height: 100%;"></div>
+           </div>
+           <div class="panel-corner-btm"></div>
+        </div>
+
+
+
+      </div>
+
+
+
+    </div>
+
+  </main>
+
+  <script>
+    // 定义后端地址 (如果你的后端在本地5000端口)
+    const API_BASE_URL = 'http://192.168.50.199:25000';
+
+    // --- 1. 系统初始化入口 ---
+    document.addEventListener('DOMContentLoaded', () => {
+        // 加载核心数据
+        fetchDashboardData();
+
+        // 加载实时日志 (这里改用了新函数)
+        fetchRealTimeLogs();
+
+// 【新增】加载文件排行
+        fetchFileRiskRank();
+        // 初始化图表和地图
+        initCommonCharts();
+        initMapModule();
+        startClock();
+        fillDevices();
+        initInfoTypeChart();
+        initSafeDays();
+/* =======================================================
+       第三步：核心动态背景脚本 (电网粒子神经网络)
+       ======================================================= */
+    (function initBackground() {
+        const canvas = document.getElementById('particle-canvas');
+        const ctx = canvas.getContext('2d');
+
+        // 配置参数 (你可以修改这里来调整效果)
+        const CONFIG = {
+            particleCount: 100,        // 粒子数量 (越多越卡，100左右适中)
+            linkDistance: 160,         // 连线距离 (超过这个距离断开)
+            mouseDistance: 200,        // 鼠标吸附距离
+            baseSpeed: 0.6,            // 粒子游动速度
+            colorNode: '0, 240, 255',  // 节点颜色 (青色 RGB)
+            colorLine: '0, 240, 255'   // 连线颜色 (青色 RGB)
+        };
+
+        let w, h;
+        let particles = [];
+        // 鼠标对象，初始位置在屏幕外
+        let mouse = { x: -1000, y: -1000 };
+
+        // 1. 粒子类定义
+        class Particle {
+            constructor() {
+                this.x = Math.random() * w;
+                this.y = Math.random() * h;
+                // 随机方向和速度
+                this.vx = (Math.random() - 0.5) * CONFIG.baseSpeed;
+                this.vy = (Math.random() - 0.5) * CONFIG.baseSpeed;
+                // 大小随机
+                this.size = Math.random() * 2 + 1;
+            }
+
+            // 更新位置
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+
+                // 碰到边界反弹
+                if (this.x < 0 || this.x > w) this.vx *= -1;
+                if (this.y < 0 || this.y > h) this.vy *= -1;
+            }
+
+            // 绘制点
+            draw() {
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fillStyle = `rgba(${CONFIG.colorNode}, 0.8)`;
+                ctx.fill();
+            }
+        }
+
+        // 2. 初始化逻辑
+        function init() {
+            resize();
+            createParticles();
+            animate();
+        }
+
+        function resize() {
+            w = canvas.width = window.innerWidth;
+            h = canvas.height = window.innerHeight;
+        }
+
+        function createParticles() {
+            particles = [];
+            // 根据屏幕面积动态计算粒子数，防止小屏太密集
+            const count = (w * h) / 15000;
+            const finalCount = Math.min(count, CONFIG.particleCount); // 设个上限
+
+            for (let i = 0; i < finalCount; i++) {
+                particles.push(new Particle());
+            }
+        }
+
+        // 3. 动画主循环
+        function animate() {
+            ctx.clearRect(0, 0, w, h);
+
+            // A. 绘制深空背景 (用代码画渐变，比图片更清晰)
+            // 这是一个从中心向四周变暗的径向渐变
+            let gradient = ctx.createRadialGradient(w/2, h/2, 0, w/2, h/2, w);
+            gradient.addColorStop(0, '#0a1525'); // 中心稍亮 (深蓝)
+            gradient.addColorStop(1, '#020408'); // 四周漆黑
+            ctx.fillStyle = gradient;
+            ctx.fillRect(0, 0, w, h);
+
+            // B. 处理所有粒子
+            for (let i = 0; i < particles.length; i++) {
+                let p1 = particles[i];
+                p1.update();
+                p1.draw();
+
+                // C. 粒子之间的连线
+                for (let j = i + 1; j < particles.length; j++) {
+                    let p2 = particles[j];
+                    let dx = p1.x - p2.x;
+                    let dy = p1.y - p2.y;
+                    let dist = Math.sqrt(dx*dx + dy*dy);
+
+                    if (dist < CONFIG.linkDistance) {
+                        // 距离越近，线越亮
+                        let opacity = 1 - (dist / CONFIG.linkDistance);
+                        ctx.strokeStyle = `rgba(${CONFIG.colorLine}, ${opacity * 0.3})`; // 0.3 是线条最大透明度
+                        ctx.lineWidth = 1;
+                        ctx.beginPath();
+                        ctx.moveTo(p1.x, p1.y);
+                        ctx.lineTo(p2.x, p2.y);
+                        ctx.stroke();
+                    }
+                }
+
+                // D. 粒子与鼠标的连线 (交互效果)
+                let mDx = p1.x - mouse.x;
+                let mDy = p1.y - mouse.y;
+                let mDist = Math.sqrt(mDx*mDx + mDy*mDy);
+
+                if (mDist < CONFIG.mouseDistance) {
+                    // 鼠标附近的连线更亮、更粗，表示“被激活”
+                    let mOpacity = 1 - (mDist / CONFIG.mouseDistance);
+                    ctx.strokeStyle = `rgba(${CONFIG.colorLine}, ${mOpacity * 0.8})`;
+                    ctx.lineWidth = 1.5;
+                    ctx.beginPath();
+                    ctx.moveTo(p1.x, p1.y);
+                    ctx.lineTo(mouse.x, mouse.y);
+                    ctx.stroke();
+                }
+            }
+
+            requestAnimationFrame(animate);
+        }
+
+        // 4. 事件监听
+        window.addEventListener('resize', () => {
+            resize();
+            createParticles();
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            mouse.x = e.clientX;
+            mouse.y = e.clientY;
+        });
+
+        // 鼠标移出窗口时，取消吸附
+        window.addEventListener('mouseout', () => {
+            mouse.x = -1000;
+            mouse.y = -1000;
+        });
+
+        // 启动！
+        init();
+    })();
+        // --- 设置定时器 ---
+        // 核心数据: 每30秒刷新一次
+        setInterval(fetchDashboardData, 30000);
+
+        // 实时日志: 每5秒刷新一次 (为了让新日志能及时弹出来)
+        setInterval(fetchRealTimeLogs, 5000);
+
+        // (可选) 重新生成无缝滚动列表: 如果日志列表很长，scrollUp CSS 动画会自动循环
+    });
+
+    function switchView(id) {
+        document.querySelectorAll('.view-section').forEach(el => el.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+        document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
+        event.currentTarget.classList.add('active');
+
+        if(id === 'dashboardView') {
+             setTimeout(() => {
+                echarts.getInstanceByDom(document.getElementById('gaugeChart'))?.resize();
+                echarts.getInstanceByDom(document.getElementById('deptBarChart'))?.resize();
+                echarts.getInstanceByDom(document.getElementById('map-container'))?.resize();
+             }, 100);
+        }
+    }
+
+    function startClock() {
+        setInterval(() => {
+            document.getElementById('sysTime').innerText = new Date().toLocaleTimeString('en-GB');
+        }, 1000);
+    }
+    // --- 修改：获取大屏统计数据 (含趋势箭头与建议更新) ---
+    async function fetchDashboardData() {
+        try {
+            // 请求后端接口
+            const res = await fetch(`${API_BASE_URL}/api/dashboard/stats`);
+            if (!res.ok) {
+                throw new Error(`HTTP error! status: ${res.status}`);
+            }
+            const data = await res.json();
+
+            // 1. 更新【敏感文件总数】及【趋势】
+            const countEl = document.getElementById('val-sensitive-count');
+            if (data.sensitive_count !== undefined) {
+                countEl.innerText = data.sensitive_count.toLocaleString();
+
+                // 更新下方的趋势 (找兄弟元素 .stat-sub)
+                const trendBox = countEl.closest('.stat-info').querySelector('.stat-sub');
+                if (trendBox) {
+                    const trendVal = data.trend || 0;
+                    // 逻辑：增长显示红色向上，减少显示绿色向下
+                    const isUp = trendVal >= 0;
+                    const colorClass = isUp ? 'trend-up' : 'trend-down';
+                    const iconClass = isUp ? 'fa-arrow-up' : 'fa-arrow-down';
+
+                    trendBox.innerHTML = `<span class="${colorClass}"><i class="fas ${iconClass}"></i> ${Math.abs(trendVal)}%</span> 较昨日`;
+                }
+            }
+
+           // 2. 更新【敏感文件泄露数】(逻辑修正：显示泄露文件数 / 总敏感文件数)
+            const riskEl = document.getElementById('val-file-risk');
+            // 注意：这里改用 leaked_file_count
+            if (data.leaked_file_count !== undefined && data.sensitive_count !== undefined) {
+                riskEl.innerHTML = `${data.leaked_file_count} <span style="font-size:1rem; color:#888;">/ ${data.sensitive_count}</span>`;
+
+                // 更新小字：下方显示累计违规次数
+                const subEl = riskEl.closest('.stat-info').querySelector('.stat-sub');
+                if (subEl && data.leak_event_count !== undefined) {
+                    // 显示具体的累计次数，让数据更全面
+                    subEl.innerText = `累计检测到 ${data.leak_event_count} 次违规外传行为`;
+                    subEl.style.color = "var(--warning)";
+                }
+            }
+
+            // 3. 更新【总体风险评级】及【建议】
+            const levelEl = document.getElementById('val-risk-level');
+            if (data.risk_rating) {
+                levelEl.innerText = data.risk_rating;
+
+                // 切换颜色类
+                levelEl.classList.remove('risk-low', 'risk-mid', 'risk-high');
+                if (data.risk_rating === '低风险') levelEl.classList.add('risk-low');
+                else if (data.risk_rating === '中风险') levelEl.classList.add('risk-mid');
+                else if (data.risk_rating === '高风险') levelEl.classList.add('risk-high');
+
+                // --- 更新建议内容 (美化字体) ---
+              // --- 更新建议内容 (红色显眼警告) ---
+                if (data.risk_suggestion) {
+                    const suggestEl = levelEl.nextElementSibling;
+                    if (suggestEl) {
+                        suggestEl.innerText = data.risk_suggestion;
+
+                        // 【修改点】改为鲜艳的红色、加粗、并添加红色发光阴影
+                        suggestEl.style.cssText = `
+                            color: #ff3333;
+                            font-size: 0.95rem;
+                            letter-spacing: 1px;
+                            font-weight: bold;
+                            margin-top: 8px;
+                            text-shadow: 0 0 10px rgba(255, 51, 51, 0.6);
+                            display: block;
+                        `;
+                    }
+                }
+            }
+
+            // 4. 更新【风险操作数】
+            if (data.risk_stats) {
+                const allHigh = document.querySelectorAll('.risk-high');
+                const allMid = document.querySelectorAll('.risk-mid');
+                const allLow = document.querySelectorAll('.risk-low');
+
+                if (allHigh.length > 0) allHigh[allHigh.length - 1].innerText = data.risk_stats.high;
+                if (allMid.length > 0) allMid[allMid.length - 1].innerText = data.risk_stats.mid;
+                if (allLow.length > 0) allLow[allLow.length - 1].innerText = data.risk_stats.low;
+            }
+
+        } catch (error) {
+            console.error("获取大屏数据失败:", error);
+        }
+    }
+// --- 修改：获取文件风险排行 (High/Mid/Low) ---
+    async function fetchFileRiskRank() {
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/dashboard/file_rank`);
+            if (!res.ok) return;
+            const list = await res.json();
+
+            const container = document.getElementById('fileRiskList');
+            container.innerHTML = '';
+
+            if (list.length === 0) {
+                container.innerHTML = '<div style="text-align:center; color:#666; padding-top:20px;">暂无文件数据</div>';
+                return;
+            }
+
+            list.forEach((item, index) => {
+                const li = document.createElement('li');
+                li.className = 'log-item';
+                li.style.justifyContent = 'space-between';
+
+                // 前3名高亮颜色
+                let rankColor = '#648db3';
+                if (index === 0) rankColor = '#ff3333';
+                else if (index === 1) rankColor = '#ff7733';
+                else if (index === 2) rankColor = '#f59e0b';
+
+                // 文件名过长截断
+                let displayName = item.name || '未知文件';
+                if (displayName.length > 12) displayName = displayName.substring(0, 12) + '...';
+
+                // --- 修改点：分别显示 高 | 中 | 低 风险数值 ---
+                li.innerHTML = `
+                    <div style="display:flex; align-items:center; gap:8px;">
+                        <span style="color:${rankColor}; font-weight:bold; width:15px; text-align:center;">${index + 1}</span>
+                        <span title="${item.name}" style="color:#e0f7ff;">${displayName}</span>
+                    </div>
+                    <div style="font-family: monospace; font-size: 0.9rem;">
+                        <span style="color:var(--danger); font-weight:bold; min-width:15px; display:inline-block; text-align:right;">${item.high_risk}</span>
+                        <span style="color:rgba(255,255,255,0.1); margin:0 3px;">|</span>
+                        <span style="color:var(--warning); font-weight:bold; min-width:15px; display:inline-block; text-align:right;">${item.mid_risk}</span>
+                        <span style="color:rgba(255,255,255,0.1); margin:0 3px;">|</span>
+                        <span style="color:var(--success); font-weight:bold; min-width:15px; display:inline-block; text-align:right;">${item.low_risk}</span>
+                    </div>
+                `;
+                container.appendChild(li);
+            });
+
+            // 滚动动画 (保持原有逻辑)
+            if (list.length > 5) {
+                list.forEach((item, index) => {
+                   const cloneLi = container.children[index].cloneNode(true);
+                   container.appendChild(cloneLi);
+                });
+                container.style.animation = 'scrollUp 20s linear infinite';
+            } else {
+                container.style.animation = 'none';
+            }
+
+        } catch (e) {
+            console.error("文件排行加载失败", e);
+        }
+    }
+
+    // 全局变量：用于记录最新的一条日志ID，防止重复弹窗
+    let lastLogId = null;
+
+    // --- 修改后的：获取实时日志 + 弹窗逻辑 ---
+    async function fetchRealTimeLogs() {
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/dashboard/logs`);
+            if (!res.ok) return;
+            const logs = await res.json();
+
+            const logContainer = document.getElementById('realTimeLogs');
+            logContainer.innerHTML = '';
+
+            if (logs.length === 0) {
+                logContainer.innerHTML = '<li class="log-item" style="justify-content:center; color:#666;">暂无违规记录</li>';
+                return;
+            }
+
+            // --- 1. 检查是否需要弹窗 ---
+            // 取最新的一条日志 (logs[0])
+            const latestLog = logs[0];
+
+            // 如果 lastLogId 还是 null (刚刷新页面)，先记录下来不弹窗
+            // 或者如果发现最新的日志ID 不同于 上次记录的ID，说明有新事件 -> 弹窗
+            if (lastLogId !== null && latestLog.log_id !== lastLogId) {
+                 showAlertModal(latestLog);
+            }
+            // 更新最后记录的ID
+            lastLogId = latestLog.log_id;
+
+
+            // --- 2. 遍历渲染日志列表 ---
+            logs.forEach(log => {
+                const li = document.createElement('li');
+                li.className = 'log-item';
+
+                // --- 核心修改：按照您的要求格式化文字 ---
+                // 格式：某办公室（党委办公室）的某人通过U盘泄露“文件名”敏感文件
+                // 注意：后端返回的 department 即为办公室名称，file_name 为文件名
+                const dept = log.department || '未知部门';
+                const user = log.user_name || '未知用户';
+                const file = log.file_name || '未知文件';
+
+                // 拼接字符串
+                const msg = `${dept}的${user}通过U盘泄露“${file}”敏感文件`;
+
+                li.innerHTML = `
+                    <span style="color:#666; font-family:monospace; margin-right:10px; width: 50px;">${log.time_str}</span>
+                    <span class="log-tag alert">U盘警报</span>
+                    <span class="log-msg" title="${msg}">
+                        ${msg}
+                    </span>
+                `;
+                logContainer.appendChild(li);
+            });
+
+            // 滚动动画逻辑(保持不变)
+            if (logs.length > 5) { /* ...之前的滚动代码... */ }
+
+        } catch (e) { console.error("日志加载失败", e); }
+    }
+
+    // --- 新增：弹窗控制函数 ---
+    function showAlertModal(log) {
+        const modal = document.getElementById('alertModal');
+        const msgBox = document.getElementById('modalMsg');
+        const timeBox = document.getElementById('modalTime');
+
+        // 构建弹窗内容
+        const dept = log.department || '未知部门';
+        const user = log.user_name || '未知用户';
+        const file = log.file_name || '未知文件';
+
+        // 使用 HTML 使得关键信息高亮
+        msgBox.innerHTML = `
+            <span class="modal-msg-highlight">${dept}</span> 的
+            <span class="modal-msg-highlight">${user}</span> <br>
+            通过 U盘 泄露 <br>
+            “<span class="modal-msg-highlight" style="color:#fff; border-bottom:1px dashed #fff;">${file}</span>” <br>
+            敏感文件
+        `;
+
+        timeBox.innerText = `检测时间: ${log.time_str}`; // 使用时间字符串
+
+        // 显示弹窗
+        modal.classList.remove('hidden');
+
+        // 播放警报音效 (可选，如果浏览器允许)
+        // const audio = new Audio('/static/alert.mp3'); audio.play().catch(e=>{});
+    }
+
+    function closeAlertModal() {
+        document.getElementById('alertModal').classList.add('hidden');
+    }
+
+      // --- 4. 初始化核心图表 (仪表盘在底部，部门排名在左侧) ---
+    async function initCommonCharts() {
+        const gaugeChart = echarts.init(document.getElementById('gaugeChart'));
+        const barChart = echarts.init(document.getElementById('deptBarChart'));
+
+        gaugeChart.showLoading({ color: '#00f0ff', maskColor: 'transparent' });
+        barChart.showLoading({ color: '#00f0ff', maskColor: 'transparent' });
+
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/dashboard/charts`);
+            if (!res.ok) throw new Error("图表数据获取失败");
+            const data = await res.json();
+
+            // --- A. 渲染安全指数仪表盘 (适配底部面板) ---
+            const score = data.security_score !== undefined ? data.security_score : 100;
+            gaugeChart.hideLoading();
+            gaugeChart.setOption({
+                series: [{
+                    type: 'gauge',
+                    startAngle: 180, endAngle: 0,
+                    min: 0, max: 100,
+                    splitNumber: 5,
+                    // --- 修改点：调整大小和位置 ---
+                    radius: '90%',
+                    center: ['50%', '70%'], // 圆心位置
+
+                    axisLine: { lineStyle: { width: 15, color: [[0.3, '#ff3333'], [0.7, '#f59e0b'], [1, '#00ffaa']] } },
+                    pointer: { show: true, length: '60%', width: 5 },
+                    axisLabel: { color: '#888', distance: 20, fontSize: 10 },
+                    detail: {
+                        valueAnimation: true,
+                        formatter: '{value}',
+                        color: '#fff',
+                        fontSize: 30,
+                        offsetCenter: [0, '-20%']
+                    },
+                    title: { offsetCenter: [0, '30%'], color: '#00f0ff', fontSize: 16 },
+                    data: [{ value: score, name: '安全指数' }]
+                }]
+            });
+
+            // --- B. 渲染部门风险排名 (保持不变) ---
+            const deptData = data.dept_rank || [];
+            const xData = deptData.map(item => item.name);
+            const yData = deptData.map(item => item.value);
+
+            barChart.hideLoading();
+            barChart.setOption({
+                grid: { top: 10, bottom: 20, left: 40, right: 10 },
+                tooltip: { trigger: 'axis' },
+                xAxis: {
+                    type: 'category',
+                    data: xData,
+                    axisLabel: {
+                        color: '#888',
+                        interval: 0,
+                        formatter: function(value) {
+                            if (!value) return "";
+                            return value.length > 3 ? value.substring(0, 3) + "..." : value;
+                        }
+                    },
+                    axisLine: { lineStyle: { color: '#333' } }
+                },
+                yAxis: {
+                    type: 'value',
+                    max: 120,
+                    splitLine: { lineStyle: { color: '#333', type:'dashed' } },
+                    axisLabel: { color: '#888' }
+                },
+                series: [{
+                    data: yData,
+                    type: 'bar',
+                    barWidth: '40%',
+                    itemStyle: {
+                        color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                            { offset: 0, color: '#ff3333' },
+                            { offset: 1, color: 'rgba(255, 51, 51, 0.1)' }
+                        ])
+                    }
+                }]
+            });
+
+        } catch (e) {
+            console.error(e);
+            gaugeChart.hideLoading();
+            barChart.hideLoading();
+        }
+
+        window.addEventListener('resize', () => {
+            gaugeChart.resize();
+            barChart.resize();
+        });
+    }
+
+
+
+
+   // --- 5. 地图模块初始化 (内网离线版) ---
+    function initMapModule() {
+        // 1. 初始化 ECharts 实例
+        const mapChart = echarts.init(document.getElementById('map-container'));
+
+        // 2. 【硬编码】设置固定的中心点坐标 (资阳市中心)
+        // 你可以去百度地图拾取坐标系统查具体的经纬度来修改这里
+        const FIXED_GEO = {
+            name: "国网资阳供电公司",  // 显示的地点名称
+            lng: 104.630713,           // 经度
+            lat: 30.146443             // 纬度
+        };
+
+        // 3. 更新页面上的文字显示
+        document.getElementById('region-name').innerText = FIXED_GEO.name;
+        document.getElementById('coords').innerText = `${FIXED_GEO.lng.toFixed(2)}, ${FIXED_GEO.lat.toFixed(2)}`;
+
+        // 4. 配置地图样式
+        const chartOption = {
+            backgroundColor: 'transparent',
+            geo: {
+                map: 'ZIYANG', // 对应下面注册的地图名称
+                roam: true,    // 允许缩放和平移
+                zoom: 1.2,
+                label: {
+                    show: true,
+                    color: '#fff',
+                    fontSize: 10
+                },
+                itemStyle: {
+                    areaColor: 'rgba(20, 102, 216, 0.3)',
+                    borderColor: '#40c5f1',
+                    borderWidth: 1,
+                    shadowColor: 'rgba(64, 197, 241, 0.6)',
+                    shadowBlur: 10
+                },
+                emphasis: { itemStyle: { areaColor: '#2B91B7' } } // 鼠标悬停高亮颜色
+            },
+            series: [{
+                name: '设备定位',
+                type: 'effectScatter', // 带有涟漪特效的点
+                coordinateSystem: 'geo',
+                data: [
+                    // 这里放置中心点的坐标，模拟设备位置
+                    {
+                        name: '指挥中心',
+                        value: [FIXED_GEO.lng, FIXED_GEO.lat]
+                    },
+                    // (可选) 如果你想模拟多个点，可以在这里加，例如：
+                    // { name: '安岳分部', value: [105.33, 30.10] }
+                ],
+                symbolSize: 15,
+                itemStyle: { color: '#FFD700', shadowBlur: 10, shadowColor: '#FFD700' },
+                rippleEffect: { period: 4, scale: 4, brushType: 'stroke' },
+                zlevel: 2,
+                // 鼠标移上去显示的内容
+                tooltip: {
+                    formatter: '{b}'
+                }
+            }]
+        };
+
+        mapChart.showLoading({ text: '加载地图中...', color: '#40c5f1', maskColor: 'rgba(0,0,0,0.1)', textColor: '#fff' });
+
+        // 5. 【核心】加载本地 GeoJSON 文件
+        // 注意：路径必须相对于你的网页，或者使用后端静态资源路径
+        fetch('/static/512000.json')
+            .then(res => {
+                if (!res.ok) throw new Error("无法加载本地地图文件");
+                return res.json();
+            })
+            .then(geoJson => {
+                mapChart.hideLoading();
+
+                // 注册地图数据，名字叫 'ZIYANG'
+                echarts.registerMap('ZIYANG', geoJson);
+
+                // 应用配置
+                mapChart.setOption(chartOption);
+            })
+            .catch(err => {
+                console.error("地图加载失败:", err);
+                mapChart.hideLoading();
+                document.getElementById('region-name').innerText = "地图加载失败";
+                // 备选方案：如果加载失败，可以在这里画一个简单的空地图占位
+            });
+
+        // 窗口大小改变时重绘
+        window.addEventListener('resize', () => mapChart.resize());
+    }
+
+        // --- 6. 获取违规设备列表 (替换为真实数据) ---
+    async function fillDevices() {
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/dashboard/devices`);
+            if (!res.ok) return;
+            const devices = await res.json();
+
+            const devContainer = document.getElementById('miniDeviceList');
+            devContainer.innerHTML = ''; // 清空假数据
+
+            if (devices.length === 0) {
+                devContainer.innerHTML = '<div style="color:#666; text-align:center; grid-column:span 2;">暂无设备数据</div>';
+                return;
+            }
+
+            devices.forEach(d => {
+                // 生成 HTML
+                // 这里的样式保持不变：红点 + 文字
+                const div = document.createElement('div');
+                div.style.cssText = "background:rgba(255,255,255,0.05); padding:8px; display:flex; align-items:center; gap:8px; border-radius:4px;";
+                div.innerHTML = `
+                    <div style="width:8px; height:8px; background:var(--danger); border-radius:50%; box-shadow:0 0 5px var(--danger);"></div>
+                    <span style="font-size:0.8rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${d.name}">${d.name}</span>
+                `;
+                devContainer.appendChild(div);
+            });
+
+        } catch (e) {
+            console.error("设备列表加载失败", e);
+        }
+    }
+
+
+// --- 7. 初始化敏感信息类型分布图 (修复布局版) ---
+    async function initInfoTypeChart() {
+        const dom = document.getElementById('infoTypeChart');
+        if (!dom) return;
+
+        const chart = echarts.init(dom);
+        chart.showLoading({ color: '#00f0ff', maskColor: 'transparent' });
+
+        try {
+            const res = await fetch(`${API_BASE_URL}/api/dashboard/pie`);
+            if (!res.ok) throw new Error("饼图数据获取失败");
+            const data = await res.json();
+
+            chart.hideLoading();
+
+            if (data.length === 0) {
+                chart.setOption({
+                    title: { text: '暂无数据', left: 'center', top: 'middle', textStyle: { color: '#666' } }
+                });
+                return;
+            }
+
+            // --- 1. 数据分列 ---
+            const allNames = data.map(item => item.name);
+            const col1Data = allNames.slice(0, 3);
+            const col2Data = allNames.slice(3, 6);
+
+            // --- 2. 样式定义 (缩小字体以适配高度) ---
+            const itemStyleBase = {
+                color: '#e0f7ff',
+                fontSize: 11,        // 【修改】改为 11px，防止挤乱
+                fontWeight: 'bold',
+                padding: [0, 0, 0, 2]
+            };
+
+            // 截断逻辑：只显示前2个字
+            const textFormatter = function(name) {
+                if (!name) return '';
+                return name.length > 5 ? name.substring(0, 5) + '..' : name;
+            };
+
+            chart.setOption({
+                // --- 标题：右上角 ---
+                title: {
+                    text: '敏感信息类型分布',
+                    left: '48%',
+                    top: '8%',            // 靠顶部
+                    textStyle: {
+                        color: '#648db3',
+                        fontSize: 12,     // 标题稍微大一点点
+                        fontWeight: 'bold'
+                    }
+                },
+
+                color: ['#00f0ff', '#0070cc', '#ff3333', '#f59e0b', '#00ffaa', '#999'],
+                tooltip: {
+                    trigger: 'item',
+                    formatter: '{b}: {c} ({d}%)',
+                    confine: true
+                },
+
+                // --- 双图例配置 ---
+                legend: [
+                    {
+                        // 左列 (1-3)
+                        tooltip: { show: true },
+                        data: col1Data,
+                        orient: 'vertical',
+                        left: '48%',           // 与标题对齐
+                        top: '35%',            // 【关键】紧接标题下方，不留太多空隙
+                        itemGap: 8,            // 【关键】收紧行间距，确保3行能放得下
+                        itemWidth: 10,
+                        itemHeight: 10,
+                        textStyle: itemStyleBase,
+                        formatter: textFormatter
+                    },
+                    {
+                        // 右列 (4-6)
+                        tooltip: { show: true },
+                        data: col2Data,
+                        orient: 'vertical',
+                        left: '75%',           // 右侧列
+                        top: '35%',            // 高度一致
+                        itemGap: 8,            // 间距一致
+                        itemWidth: 10,
+                        itemHeight: 10,
+                        textStyle: itemStyleBase,
+                        formatter: textFormatter
+                    }
+                ],
+                series: [
+                    {
+                        name: '敏感信息类型',
+                        type: 'pie',
+                        // --- 饼图位置 ---
+                        radius: ['55%', '85%'],
+                        center: ['22%', '55%'],  // 保持在左侧居中
+
+                        avoidLabelOverlap: false,
+                        itemStyle: {
+                            borderRadius: 3,
+                            borderColor: '#050a15',
+                            borderWidth: 2
+                        },
+                        label: { show: false },
+                        labelLine: { show: false },
+                        data: data
+                    }
+                ]
+            });
+
+        } catch (e) {
+            console.error(e);
+            chart.hideLoading();
+        }
+
+        window.addEventListener('resize', () => chart.resize());
+    }
+    // --- 8. 禁止缩放 ---
+    document.addEventListener('wheel', function(event) { if (event.ctrlKey) event.preventDefault(); }, { passive: false });
+    document.addEventListener('keydown', function(event) { if ((event.ctrlKey || event.metaKey) && (event.key === '+' || event.key === '-' || event.key === '=' || event.key === '0' || event.key === 'NumPadPlus' || event.key === 'NumPadMinus')) event.preventDefault(); });
+    document.addEventListener('touchmove', function(event) { if (event.scale !== 1) event.preventDefault(); }, { passive: false });
+    let lastTouchEnd = 0;
+    document.addEventListener('touchend', function(event) { const now = (new Date()).getTime(); if (now - lastTouchEnd <= 300) event.preventDefault(); lastTouchEnd = now; }, false);
+// --- 新增：计算持续运行天数 ---
+    // --- 修改：计算持续运行天数 (增加补零逻辑) ---
+    function initSafeDays() {
+        const startDate = new Date('2026-01-20T00:00:00'); // 假设这是起始时间
+        const now = new Date();
+        const diffTime = now - startDate;
+        let days = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+
+        if (days < 0) days = 0;
+
+        const el = document.getElementById('safe-days-count');
+        if (el) {
+            // 补零逻辑：如果不满3位数，前面补0 (例如 5 -> 005)
+            const formattedDays = days.toString().padStart(3, '0');
+            el.innerText = formattedDays;
+        }
+    }
+  </script>
+<div id="alertModal" class="modal-overlay hidden">
+  <div class="modal-box">
+    <div class="modal-header">
+      <i class="fas fa-exclamation-triangle"></i> 严重安全威胁警报
+    </div>
+    <div class="modal-content">
+      <div id="modalMsg" class="modal-msg-text">
+        </div>
+      <div class="modal-time" id="modalTime"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="modal-btn" onclick="closeAlertModal()">确认处置</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>
