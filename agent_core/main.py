@@ -18,12 +18,15 @@ from .comms import ServerClient
 from .config import (
     AGENT_VERSION,
     DEFAULT_SERVER_BASE,
+    GRPC_UPLOAD_TARGET,
     INSTALL_CONFIG_PATH,
     PROGRAM_DATA_DIR,
+    SERVER_BASE,
     SERVICE_DESCRIPTION,
     SERVICE_DISPLAY_NAME,
     SERVICE_NAME,
     WORK_DIR,
+    agent_config_diagnostics,
     ensure_dirs,
     parse_runtime_config,
     setup_logging,
@@ -45,12 +48,36 @@ class AgentRuntime:
         self.store.recover_if_needed()
         self.store.reset_in_progress_tasks()
         self.client = ServerClient(self.store, self.logger)
+        self._log_base_config()
         cached_config = self.store.get_json_state("config_json", {})
         self.runtime_config = parse_runtime_config(cached_config)
+        self.client.request_timeout = int(self.runtime_config.request_timeout)
+        self._log_runtime_config("cache" if cached_config else "defaults", self.runtime_config)
         self.scanner = AgentScanner(self.store, self.logger, self.runtime_config)
         self.stop_event = threading.Event()
         self.threads: dict[str, threading.Thread] = {}
         self._upgrade_lock = threading.Lock()
+
+    def _log_base_config(self):
+        payload = agent_config_diagnostics()
+        self.logger.info("agent base config effective=%s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        for conflict in payload.get("conflicts") or []:
+            self.logger.warning("agent base config conflict=%s", json.dumps(conflict, ensure_ascii=False, sort_keys=True))
+
+    def _log_runtime_config(self, source: str, runtime_config):
+        payload = {
+            "source": source,
+            "config_version": runtime_config.config_version,
+            "scan_roots": runtime_config.scan_roots,
+            "watch_dirs": runtime_config.watch_dirs,
+            "include_extensions": runtime_config.include_extensions,
+            "exclude_paths": runtime_config.exclude_paths,
+            "heartbeat_interval": runtime_config.heartbeat_interval,
+            "config_pull_interval": runtime_config.config_pull_interval,
+            "upload_workers": runtime_config.upload_workers,
+            "request_timeout": runtime_config.request_timeout,
+        }
+        self.logger.info("agent runtime config effective=%s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
     def set_state(self, value: str):
         self.store.set_current_state(value)
@@ -102,12 +129,16 @@ class AgentRuntime:
         cached = self.store.get_json_state("config_json", {})
         if cached:
             self.runtime_config = parse_runtime_config(cached)
+            self.client.request_timeout = int(self.runtime_config.request_timeout)
+            self._log_runtime_config("cache", self.runtime_config)
             self.scanner.update_runtime_config(self.runtime_config)
 
         try:
             fresh = self.client.fetch_config()
             if fresh.get("status") == "ok":
                 self.runtime_config = parse_runtime_config(fresh)
+                self.client.request_timeout = int(self.runtime_config.request_timeout)
+                self._log_runtime_config("server", self.runtime_config)
                 self.scanner.update_runtime_config(self.runtime_config)
         except Exception as exc:
             self.logger.warning("initial config fetch failed, continue with cache: %s", exc)
@@ -153,6 +184,8 @@ class AgentRuntime:
                 data = self.client.fetch_config()
                 if data.get("status") == "ok":
                     self.runtime_config = parse_runtime_config(data)
+                    self.client.request_timeout = int(self.runtime_config.request_timeout)
+                    self._log_runtime_config("server", self.runtime_config)
                     self.scanner.update_runtime_config(self.runtime_config)
                     if self.store.is_scan_completed():
                         self.scanner.start_monitoring()
@@ -224,6 +257,8 @@ class AgentRuntime:
                 data = self.client.fetch_config()
                 if data.get("status") == "ok":
                     self.runtime_config = parse_runtime_config(data)
+                    self.client.request_timeout = int(self.runtime_config.request_timeout)
+                    self._log_runtime_config("server", self.runtime_config)
                     self.scanner.update_runtime_config(self.runtime_config)
             except Exception as exc:
                 self.logger.warning("piggyback config refresh failed: %s", exc)
@@ -440,9 +475,16 @@ def _packaged_install_settings() -> dict:
     return {}
 
 
-def _write_install_settings(server_base: str, work_dir: str):
+def _write_install_settings(server_base: str, work_dir: str, grpc_upload_target: str):
     PROGRAM_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"server_base": server_base.rstrip("/"), "work_dir": str(Path(work_dir))}
+    payload = {
+        "schema_version": 1,
+        "server_base": server_base.rstrip("/"),
+        "work_dir": str(Path(work_dir)),
+        "grpc_upload_target": grpc_upload_target,
+        "written_by": "safeguard_agent_installer",
+        "written_at": time.time(),
+    }
     INSTALL_CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -492,6 +534,8 @@ def _build_install_report_html(
     heartbeat_at: str,
     heartbeat_result: dict | None,
     scan_roots: list[str],
+    grpc_upload_target: str,
+    config_sources: dict | None,
 ) -> str:
     scan_roots_html = "".join(f"<li>{html.escape(item)}</li>" for item in scan_roots) or "<li>(未获取到)</li>"
     register_json = html.escape(json.dumps(register_result or {}, ensure_ascii=False, indent=2))
@@ -522,6 +566,8 @@ def _build_install_report_html(
     <div class="grid">
       <div class="item"><div class="label">服务端地址</div><div class="value">{html.escape(server_base)}</div></div>
       <div class="item"><div class="label">工作目录</div><div class="value">{html.escape(work_dir)}</div></div>
+      <div class="item"><div class="label">gRPC 上传地址</div><div class="value">{html.escape(grpc_upload_target)}</div></div>
+      <div class="item"><div class="label">主配置文件</div><div class="value">{html.escape(str(INSTALL_CONFIG_PATH))}</div></div>
       <div class="item"><div class="label">服务状态</div><div class="value">{html.escape(service_state)}</div></div>
       <div class="item"><div class="label">Agent ID</div><div class="value">{html.escape(agent_id or "-")}</div></div>
       <div class="item"><div class="label">当前配置版本</div><div class="value">{html.escape(config_version or "-")}</div></div>
@@ -531,6 +577,8 @@ def _build_install_report_html(
     </div>
     <h2>当前生效扫描目录</h2>
     <ul>{scan_roots_html}</ul>
+    <h2>基础配置来源</h2>
+    <pre>{html.escape(json.dumps(config_sources or {}, ensure_ascii=False, indent=2))}</pre>
     <h2>最近一次注册结果</h2>
     <pre>{register_json}</pre>
     <h2>最近一次心跳结果</h2>
@@ -541,7 +589,7 @@ def _build_install_report_html(
 """
 
 
-def _show_install_result_page(*, server_base: str, work_dir: str, temp_store: AgentStore, scan_roots: list[str]):
+def _show_install_result_page(*, server_base: str, work_dir: str, grpc_upload_target: str, temp_store: AgentStore, scan_roots: list[str]):
     agent_id = temp_store.get_state("agent_id", "") or ""
     config_version = temp_store.get_state("config_version", "") or ""
     register_at = _format_time_text(temp_store.get_state("last_register_at", ""))
@@ -554,6 +602,8 @@ def _show_install_result_page(*, server_base: str, work_dir: str, temp_store: Ag
         _build_install_report_html(
             server_base=server_base,
             work_dir=work_dir,
+            grpc_upload_target=grpc_upload_target,
+            config_sources=agent_config_diagnostics(),
             service_state=service_state,
             agent_id=agent_id,
             config_version=config_version,
@@ -575,6 +625,8 @@ def _show_install_result_page(*, server_base: str, work_dir: str, temp_store: Ag
         "安装完成，服务已启动。\n\n"
         f"服务端地址: {server_base}\n"
         f"工作目录: {work_dir}\n"
+        f"gRPC 上传地址: {grpc_upload_target}\n"
+        f"主配置文件: {INSTALL_CONFIG_PATH}\n"
         f"服务状态: {service_state}\n"
         f"Agent ID: {agent_id or '-'}\n"
         f"当前配置版本: {config_version or '-'}\n"
@@ -598,13 +650,13 @@ def _stop_service_if_exists():
         time.sleep(1)
 
 
-def _install_service(server_base: str | None = None, work_dir: str | None = None, auto_start: bool = True):
-    settings = _packaged_install_settings()
-    server_base = str(server_base or settings.get("server_base") or DEFAULT_SERVER_BASE).rstrip("/")
-    work_dir = str(work_dir or settings.get("work_dir") or WORK_DIR)
+def _install_service(server_base: str | None = None, work_dir: str | None = None, grpc_upload_target: str | None = None, auto_start: bool = True):
+    server_base = str(server_base or SERVER_BASE or DEFAULT_SERVER_BASE).rstrip("/")
+    work_dir = str(work_dir or WORK_DIR)
+    grpc_upload_target = str(grpc_upload_target or GRPC_UPLOAD_TARGET)
     exe_path = _service_exe_path()
 
-    _write_install_settings(server_base, work_dir)
+    _write_install_settings(server_base, work_dir, grpc_upload_target)
     Path(work_dir).mkdir(parents=True, exist_ok=True)
 
     if _service_exists():
@@ -643,9 +695,9 @@ def _restart_service():
     win32serviceutil.StartService(SERVICE_NAME)
 
 
-def _elevate_for_install(server_base: str, work_dir: str):
+def _elevate_for_install(server_base: str, work_dir: str, grpc_upload_target: str):
     exe_path = str(_service_exe_path())
-    params = f'--self-install --server-base "{server_base}" --work-dir "{work_dir}"'
+    params = f'--self-install --server-base "{server_base}" --work-dir "{work_dir}" --grpc-upload-target "{grpc_upload_target}"'
     result = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe_path, params, None, 1)
     if int(result) <= 32:
         raise RuntimeError(f"failed to elevate installer, code={int(result)}")
@@ -665,15 +717,15 @@ def _self_install():
     if not installer_guard.acquire():
         _message_box("SafeGuard Agent", "已有另一个 SafeGuard 安装程序正在运行。")
         return
-    settings = _packaged_install_settings()
-    server_base = str(_value_after_flag("--server-base") or settings.get("server_base") or DEFAULT_SERVER_BASE).rstrip("/")
-    work_dir = str(_value_after_flag("--work-dir") or settings.get("work_dir") or WORK_DIR)
+    server_base = str(_value_after_flag("--server-base") or SERVER_BASE or DEFAULT_SERVER_BASE).rstrip("/")
+    work_dir = str(_value_after_flag("--work-dir") or WORK_DIR)
+    grpc_upload_target = str(_value_after_flag("--grpc-upload-target") or GRPC_UPLOAD_TARGET)
     try:
         if not _is_admin():
-            _elevate_for_install(server_base, work_dir)
+            _elevate_for_install(server_base, work_dir, grpc_upload_target)
             return
 
-        _install_service(server_base=server_base, work_dir=work_dir, auto_start=True)
+        _install_service(server_base=server_base, work_dir=work_dir, grpc_upload_target=grpc_upload_target, auto_start=True)
         effective_scan_roots = []
         temp_store = None
         try:
@@ -698,6 +750,7 @@ def _self_install():
         _show_install_result_page(
             server_base=server_base,
             work_dir=work_dir,
+            grpc_upload_target=grpc_upload_target,
             temp_store=temp_store,
             scan_roots=effective_scan_roots,
         )
@@ -748,6 +801,7 @@ def entrypoint():
             _install_service(
                 server_base=_value_after_flag("--server-base"),
                 work_dir=_value_after_flag("--work-dir"),
+                grpc_upload_target=_value_after_flag("--grpc-upload-target"),
                 auto_start=True,
             )
             return

@@ -4,15 +4,12 @@ import secrets
 from pathlib import Path
 from typing import Optional
 
-import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 
 from config_app import (
     API_PREFIX,
     APP_VERSION,
-    OCR_SERVICE_TIMEOUT_SECONDS,
-    OCR_SERVICE_URL,
     UPGRADE_STORE_DIR,
     get_admin_basic_password,
     get_admin_basic_user,
@@ -41,8 +38,10 @@ from detection.rules import (
     list_detection_rules,
     update_detection_rule,
 )
+from grpc_upload_server import check_grpc_health
 from services import (
     authenticate_agent,
+    check_ocr_service_health,
     get_admin_global_config,
     get_agent_config,
     get_file_detail,
@@ -329,20 +328,12 @@ def admin_upgrades_endpoint(limit: int = 100, _=Depends(require_admin_auth)):
 
 @router.get("/admin/ocr/health")
 def admin_ocr_health_endpoint(_=Depends(require_admin_auth)):
-    try:
-        with httpx.Client(timeout=OCR_SERVICE_TIMEOUT_SECONDS) as client:
-            response = client.get(f"{OCR_SERVICE_URL}/health")
-            response.raise_for_status()
-            data = response.json()
-        healthy = data.get("status") == "ok" and data.get("ready") is not False and not data.get("init_error")
-        return {
-            "status": "ok" if healthy else "error",
-            "service_url": OCR_SERVICE_URL,
-            "health": data,
-            "error": data.get("init_error") if not healthy else None,
-        }
-    except Exception as exc:
-        return {"status": "error", "service_url": OCR_SERVICE_URL, "error": str(exc)}
+    return check_ocr_service_health()
+
+
+@router.get("/admin/grpc/health")
+def admin_grpc_health_endpoint(_=Depends(require_admin_auth)):
+    return check_grpc_health()
 
 
 @router.get("/admin/files/{file_hash}")

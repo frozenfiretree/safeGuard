@@ -1,4 +1,5 @@
 import hashlib
+import csv
 import json
 import re
 import shutil
@@ -185,9 +186,9 @@ def _normalize_pdf_text(value: str) -> str:
     return re.sub(r"\s+", "", value)
 
 
-def _highlight_pdf(source: Path, target: Path, hits: list[str]) -> Optional[str]:
+def _highlight_pdf(source: Path, target: Path, hits: list[str]) -> tuple[Optional[str], int]:
     if not hits:
-        return None
+        return None, 0
     import fitz
 
     doc = fitz.open(source)
@@ -210,11 +211,204 @@ def _highlight_pdf(source: Path, target: Path, hits: list[str]) -> Optional[str]
                     applied += 1
     if applied <= 0:
         doc.close()
-        return None
+        return None, 0
     target.parent.mkdir(parents=True, exist_ok=True)
     doc.save(target, garbage=4, deflate=True)
     doc.close()
-    return "pdf_native_highlight_pdf"
+    return "pdf_native_highlight_pdf", applied
+
+
+def _classify_pdf_file(source: Path) -> dict:
+    try:
+        import fitz
+
+        doc = fitz.open(source)
+        pages_with_text = 0
+        pages_without_text = 0
+        image_blocks = 0
+        for page in doc:
+            if (page.get_text("text") or "").strip():
+                pages_with_text += 1
+            else:
+                pages_without_text += 1
+            image_blocks += len(page.get_images(full=True))
+        page_count = len(doc)
+        doc.close()
+        if pages_with_text and pages_without_text:
+            pdf_type = "hybrid_pdf"
+        elif pages_with_text:
+            pdf_type = "text_pdf"
+        elif image_blocks:
+            pdf_type = "scanned_pdf"
+        else:
+            pdf_type = "empty_pdf"
+        return {
+            "pdf_type": pdf_type,
+            "page_count": page_count,
+            "pages_with_text": pages_with_text,
+            "pages_without_text": pages_without_text,
+            "image_blocks": image_blocks,
+        }
+    except Exception as exc:
+        return {"pdf_type": "unknown_pdf", "error": str(exc)}
+
+
+def _parse_page_from_location(location: str) -> Optional[int]:
+    match = re.search(r"(?:^|:)page:(\d+)(?:$|:)", location or "")
+    if not match:
+        return None
+    return max(int(match.group(1)) - 1, 0)
+
+
+def _highlight_pdf_ocr_boxes(source: Path, target: Path, hits: list[dict[str, Any]]) -> tuple[Optional[str], int]:
+    import fitz
+
+    doc = fitz.open(source)
+    applied = 0
+    for hit in hits:
+        bbox = hit.get("bbox")
+        if not bbox:
+            continue
+        page_idx = _parse_page_from_location(str(hit.get("location") or ""))
+        if page_idx is None or page_idx >= len(doc):
+            continue
+        points = []
+        for item in bbox:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    points.append((float(item[0]), float(item[1])))
+                except Exception:
+                    continue
+        if len(points) < 2:
+            continue
+        page = doc[page_idx]
+        page_rect = page.rect
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        max_x = max(xs) or page_rect.width
+        max_y = max(ys) or page_rect.height
+        scale_x = page_rect.width / max_x if max_x > page_rect.width * 1.25 else 1.0
+        scale_y = page_rect.height / max_y if max_y > page_rect.height * 1.25 else 1.0
+        rect = fitz.Rect(min(xs) * scale_x, min(ys) * scale_y, max(xs) * scale_x, max(ys) * scale_y)
+        rect = rect & page_rect
+        if rect.is_empty or rect.width < 1 or rect.height < 1:
+            continue
+        annot = page.add_rect_annot(rect)
+        if annot:
+            annot.set_colors(stroke=(1, 0.2, 0.1), fill=(1, 0.95, 0.2))
+            annot.set_opacity(0.28)
+            annot.set_info(content=f"Sensitive OCR hit: {str(hit.get('matched_text') or '')[:80]}")
+            annot.update()
+            applied += 1
+    if applied <= 0:
+        doc.close()
+        return None, 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(target, garbage=4, deflate=True)
+    doc.close()
+    return "pdf_ocr_bbox_highlight_pdf", applied
+
+
+def _hit_matches(text: str, hits: list[str]) -> bool:
+    value = str(text or "")
+    if not value:
+        return False
+    normalized = _normalize_pdf_text(value)
+    return any(hit in value or _normalize_pdf_text(hit) in normalized for hit in hits)
+
+
+def _highlight_pptx(source: Path, target: Path, hits: list[str]) -> tuple[Optional[str], int]:
+    if not hits:
+        return None, 0
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+
+    prs = Presentation(source)
+    applied = 0
+
+    def mark_shape(shape) -> None:
+        nonlocal applied
+        if getattr(shape, "has_text_frame", False) and _hit_matches(getattr(shape, "text", ""), hits):
+            try:
+                shape.fill.solid()
+                shape.fill.fore_color.rgb = RGBColor(255, 242, 128)
+            except Exception:
+                pass
+            try:
+                shape.line.color.rgb = RGBColor(255, 64, 64)
+            except Exception:
+                pass
+            applied += 1
+        if getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                for cell in row.cells:
+                    if _hit_matches(cell.text, hits):
+                        try:
+                            cell.fill.solid()
+                            cell.fill.fore_color.rgb = RGBColor(255, 242, 128)
+                        except Exception:
+                            pass
+                        applied += 1
+        if hasattr(shape, "shapes"):
+            for child in shape.shapes:
+                mark_shape(child)
+
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            mark_shape(shape)
+    if applied <= 0:
+        return None, 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(target)
+    return "pptx_shape_highlight", applied
+
+
+def _highlight_xlsx(source: Path, target: Path, hits: list[str]) -> tuple[Optional[str], int]:
+    if not hits:
+        return None, 0
+    import openpyxl
+    from openpyxl.styles import PatternFill
+
+    wb = openpyxl.load_workbook(source)
+    fill = PatternFill(fill_type="solid", fgColor="FFF280")
+    applied = 0
+    for sheet in wb.worksheets:
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.value is not None and _hit_matches(str(cell.value), hits):
+                    cell.fill = fill
+                    applied += 1
+    if applied <= 0:
+        return None, 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(target)
+    return "xlsx_cell_highlight", applied
+
+
+def _highlight_csv(source: Path, target: Path, hits: list[str]) -> tuple[Optional[str], int]:
+    if not hits:
+        return None, 0
+    import openpyxl
+    from openpyxl.styles import PatternFill
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "csv_highlight"
+    fill = PatternFill(fill_type="solid", fgColor="FFF280")
+    applied = 0
+    with open(source, "r", encoding="utf-8-sig", errors="ignore", newline="") as handle:
+        reader = csv.reader(handle)
+        for row_idx, row in enumerate(reader, start=1):
+            for col_idx, value in enumerate(row, start=1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                if _hit_matches(value, hits):
+                    cell.fill = fill
+                    applied += 1
+    if applied <= 0:
+        return None, 0
+    target.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(target)
+    return "csv_xlsx_highlight", applied
 
 
 def _create_highlight(source: Optional[Path], target_dir: Path, version_no: int, name: str, hits: list[dict[str, Any]]) -> tuple[Optional[str], Optional[str], dict]:
@@ -225,12 +419,29 @@ def _create_highlight(source: Optional[Path], target_dir: Path, version_no: int,
     if suffix == ".docx":
         target = target_dir / f"v{version_no}_{_safe_name(Path(name).stem)}_highlight.docx"
         artifact_type = _highlight_docx(source, target, hit_values)
-        return (str(target), artifact_type, {"status": "ok" if artifact_type else "no_hits", "strategy": "docx_run_or_paragraph"})
+        return (str(target) if artifact_type else None, artifact_type, {"status": "ok" if artifact_type else "no_hits", "strategy": "docx_run_or_paragraph"})
     if suffix == ".pdf":
         target = target_dir / f"v{version_no}_{_safe_name(Path(name).stem)}_native_highlight.pdf"
-        artifact_type = _highlight_pdf(source, target, hit_values)
-        status = "ok" if artifact_type else "fallback_text_only"
-        return (str(target) if artifact_type else None, artifact_type, {"status": status, "strategy": "pdf_native_textmarkup_annotation"})
+        pdf_info = _classify_pdf_file(source)
+        artifact_type, applied = _highlight_pdf(source, target, hit_values)
+        if artifact_type:
+            return (str(target), artifact_type, {"status": "ok", "strategy": "pdf_native_textmarkup_annotation", "applied_count": applied, **pdf_info})
+        target = target_dir / f"v{version_no}_{_safe_name(Path(name).stem)}_ocr_bbox_highlight.pdf"
+        artifact_type, applied = _highlight_pdf_ocr_boxes(source, target, hits)
+        status = "ok" if artifact_type else "no_pdf_coordinates"
+        return (str(target) if artifact_type else None, artifact_type, {"status": status, "strategy": "pdf_ocr_bbox_annotation", "applied_count": applied, **pdf_info})
+    if suffix == ".pptx":
+        target = target_dir / f"v{version_no}_{_safe_name(Path(name).stem)}_highlight.pptx"
+        artifact_type, applied = _highlight_pptx(source, target, hit_values)
+        return (str(target) if artifact_type else None, artifact_type, {"status": "ok" if artifact_type else "no_hits", "strategy": "pptx_shape_or_cell_fill", "applied_count": applied})
+    if suffix == ".xlsx":
+        target = target_dir / f"v{version_no}_{_safe_name(Path(name).stem)}_highlight.xlsx"
+        artifact_type, applied = _highlight_xlsx(source, target, hit_values)
+        return (str(target) if artifact_type else None, artifact_type, {"status": "ok" if artifact_type else "no_hits", "strategy": "xlsx_cell_fill", "applied_count": applied})
+    if suffix == ".csv":
+        target = target_dir / f"v{version_no}_{_safe_name(Path(name).stem)}_highlight.xlsx"
+        artifact_type, applied = _highlight_csv(source, target, hit_values)
+        return (str(target) if artifact_type else None, artifact_type, {"status": "ok" if artifact_type else "no_hits", "strategy": "csv_export_to_xlsx_cell_fill", "applied_count": applied})
     return None, None, {"status": "unsupported_file_type"}
 
 

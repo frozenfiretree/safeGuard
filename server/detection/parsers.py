@@ -219,10 +219,13 @@ def _extract_pdf(path: Path) -> Dict:
     text_blocks = []
     image_blocks = []
     pages_without_text = 0
+    pages_with_text = 0
+    page_count = len(doc)
 
     for page_idx, page in enumerate(doc, start=1):
         text = (page.get_text("text") or "").strip()
         if text:
+            pages_with_text += 1
             for line_idx, line in enumerate(text.splitlines(), start=1):
                 line = line.strip()
                 if line:
@@ -241,11 +244,26 @@ def _extract_pdf(path: Path) -> Dict:
                     )
             except Exception:
                 continue
+    if pages_with_text and pages_without_text:
+        pdf_type = "hybrid_pdf"
+    elif pages_with_text:
+        pdf_type = "text_pdf"
+    elif image_blocks:
+        pdf_type = "scanned_pdf"
+    else:
+        pdf_type = "empty_pdf"
 
     return {
         "text_blocks": text_blocks,
         "image_blocks": image_blocks,
         "needs_ocr": bool(image_blocks) or pages_without_text > 0,
+        "pdf_type": pdf_type,
+        "pdf_meta": {
+            "page_count": page_count,
+            "pages_with_text": pages_with_text,
+            "pages_without_text": pages_without_text,
+            "image_blocks": len(image_blocks),
+        },
         "pages_without_text": pages_without_text,
         "parse_status": "ok",
     }

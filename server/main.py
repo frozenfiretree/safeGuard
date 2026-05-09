@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 
 from api import router as v1_router, rules_alias_router
 from config_app import APP_VERSION, setup_app_logger, validate_production_settings
-from grpc_upload_server import start_grpc_server
+from grpc_upload_server import mark_grpc_server_stopped, start_grpc_server
 from storage import init_db
 
 
@@ -29,6 +29,7 @@ async def lifespan(app: FastAPI):
     grpc_server = getattr(app.state, "grpc_server", None)
     if grpc_server:
         grpc_server.stop(grace=5)
+        mark_grpc_server_stopped()
 
 
 app = FastAPI(title="SafeGuard Server V2", version=APP_VERSION, lifespan=lifespan)
@@ -71,5 +72,4 @@ def serve_webui_index():
     if WEBUI_INDEX.exists():
         return FileResponse(str(WEBUI_INDEX))
     return {"status": "ok", "version": APP_VERSION}
-
 

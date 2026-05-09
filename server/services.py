@@ -10,6 +10,8 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import httpx
+
 from config_app import (
     APP_VERSION,
     DATA_DIR,
@@ -20,6 +22,8 @@ from config_app import (
     TOKEN_REFRESH_THRESHOLD_SECONDS,
     TOKEN_TTL_SECONDS,
     UPLOAD_SESSION_TTL_SECONDS,
+    OCR_SERVICE_TIMEOUT_SECONDS,
+    OCR_SERVICE_URL,
     UploadSessionStatus,
     AgentStatus,
     FileDetectionStatus,
@@ -50,6 +54,56 @@ logger = setup_app_logger("services")
 
 def _now() -> float:
     return time.time()
+
+
+def check_ocr_service_health() -> dict:
+    started = time.time()
+    base = {
+        "status": "error",
+        "service": "ocr",
+        "service_url": OCR_SERVICE_URL,
+        "service_alive": False,
+        "latency_ms": None,
+        "ready": False,
+        "models_ok": False,
+        "ocr_initialized": False,
+        "warmup_completed": False,
+        "runtime_device": None,
+        "missing_items": [],
+        "health": None,
+        "error": None,
+    }
+    try:
+        with httpx.Client(timeout=OCR_SERVICE_TIMEOUT_SECONDS) as client:
+            response = client.get(f"{OCR_SERVICE_URL}/status")
+            if response.status_code == 404:
+                response = client.get(f"{OCR_SERVICE_URL}/health")
+            response.raise_for_status()
+            data = response.json()
+        latency_ms = int((time.time() - started) * 1000)
+        init_error = data.get("init_error") or data.get("error")
+        ready = bool(data.get("ready", data.get("status") == "ok") and data.get("models_ok", True) and not init_error)
+        return {
+            **base,
+            "status": "ok" if ready else "error",
+            "service_alive": True,
+            "latency_ms": latency_ms,
+            "ready": ready,
+            "models_ok": bool(data.get("models_ok", ready)),
+            "ocr_initialized": bool(data.get("ocr_initialized") or data.get("model_loaded")),
+            "warmup_completed": bool(data.get("warmup_completed")),
+            "warmup_in_progress": bool(data.get("warmup_in_progress")),
+            "runtime_device": data.get("runtime_device"),
+            "gpu_requested": data.get("gpu_requested"),
+            "gpu_enabled": data.get("gpu_enabled"),
+            "missing_items": data.get("missing_items") or data.get("model_integrity", {}).get("missing_items") or [],
+            "model_home": data.get("model_home") or data.get("model_integrity", {}).get("model_home"),
+            "health": data,
+            "error": init_error if not ready else None,
+        }
+    except Exception as exc:
+        latency_ms = int((time.time() - started) * 1000)
+        return {**base, "latency_ms": latency_ms, "error": str(exc)}
 
 
 def _hash_token(token: str) -> str:
