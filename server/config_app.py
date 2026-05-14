@@ -26,6 +26,11 @@ MINIO_SECURE = os.environ.get("SAFEGUARD_MINIO_SECURE", "false").lower() == "tru
 MINIO_BUCKET = os.environ.get("SAFEGUARD_MINIO_BUCKET", "safeguard")
 OCR_SERVICE_URL = os.environ.get("SAFEGUARD_OCR_SERVICE_URL", "http://127.0.0.1:8010").rstrip("/")
 OCR_SERVICE_TIMEOUT_SECONDS = int(os.environ.get("SAFEGUARD_OCR_SERVICE_TIMEOUT_SECONDS", "60"))
+OCR_MODEL_HOME = os.environ.get("SAFEGUARD_OCR_MODEL_HOME", str(BASE_DIR / "artifacts" / "models" / "paddlex_models")).strip()
+OCR_MODELS_ZIP = os.environ.get("SAFEGUARD_OCR_MODELS_ZIP", str(BASE_DIR / "artifacts" / "models.zip")).strip()
+OCR_WARMUP_ENABLED = os.environ.get("SAFEGUARD_OCR_WARMUP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+OCR_WARMUP_TIMEOUT_SECONDS = int(os.environ.get("SAFEGUARD_OCR_WARMUP_TIMEOUT_SECONDS", "120"))
+OCR_MODEL_CHECK_TIMEOUT_SECONDS = int(os.environ.get("SAFEGUARD_OCR_MODEL_CHECK_TIMEOUT_SECONDS", "30"))
 GRPC_UPLOAD_HOST = os.environ.get("SAFEGUARD_GRPC_UPLOAD_HOST", "0.0.0.0").strip() or "0.0.0.0"
 GRPC_UPLOAD_PORT = int(os.environ.get("SAFEGUARD_GRPC_UPLOAD_PORT", "50051"))
 REQUIRE_PRODUCTION_DEPS = os.environ.get("SAFEGUARD_REQUIRE_PRODUCTION_DEPS", "false").lower() in {"1", "true", "yes", "on"}

@@ -196,7 +196,7 @@ def ensure_default_detection_rules() -> None:
                     enabled=True,
                     description="用于图片、PDF 扫描页和嵌入图片 OCR 文本的关键字规则。",
                     priority=20,
-                    config={"keywords": DEFAULT_KEYWORDS, "apply_file_types": ["png", "jpg", "jpeg", "bmp", "pdf", "docx", "xlsx", "pptx"], "case_sensitive": False},
+                    config={"keywords": DEFAULT_KEYWORDS, "apply_file_types": ["png", "jpg", "jpeg", "bmp", "pdf", "doc", "docx", "xlsx", "ppt", "pptx"], "case_sensitive": False},
                     created_at=now,
                     updated_at=now,
                 ),

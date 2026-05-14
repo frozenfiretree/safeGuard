@@ -2,7 +2,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
-from sqlalchemy import JSON, Boolean, Float, Integer, Text, create_engine
+from sqlalchemy import JSON, Boolean, Float, Integer, Text, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from config_app import DATABASE_URL
@@ -12,7 +12,26 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_engine(DATABASE_URL, future=True)
+_engine_kwargs = {"future": True}
+if DATABASE_URL.startswith("sqlite"):
+    _engine_kwargs["connect_args"] = {"timeout": 30, "check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
+
+
+@event.listens_for(engine, "connect")
+def _configure_sqlite_connection(dbapi_connection, connection_record):
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+    finally:
+        cursor.close()
+
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
 
 
@@ -327,6 +346,15 @@ class AdminConfigUpdateRequest(BaseModel):
     heartbeat_interval_sec: Optional[int] = None
     watch_dirs: Optional[List[str]] = None
     upgrade: Optional[Dict[str, Any]] = None
+
+
+class AssetDiscoveryRequest(BaseModel):
+    mode: str = "auto"
+    targets: Optional[List[str]] = None
+    include_port_scan: bool = True
+    include_os_detect: bool = True
+    timeout: int = 60
+    ports: Optional[List[int]] = None
 
 
 class DetectionRuleCreateRequest(BaseModel):

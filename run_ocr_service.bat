@@ -26,7 +26,12 @@ for /f "tokens=5" %%p in ('netstat -ano ^| findstr ":8010" ^| findstr "LISTENING
   exit /b 0
 )
 
-"%PYTHON_EXE%" -m uvicorn ocr_service:app --host 127.0.0.1 --port 8010 --reload
+if "%SAFEGUARD_OCR_RELOAD%"=="1" (
+  echo OCR hot reload is enabled by SAFEGUARD_OCR_RELOAD=1.
+  "%PYTHON_EXE%" -m uvicorn ocr_service:app --host 127.0.0.1 --port 8010 --reload --reload-include ocr_service.py --reload-include config_app.py --reload-exclude tracked_files.py --reload-exclude data/* --reload-exclude logs/*
+) else (
+  "%PYTHON_EXE%" -m uvicorn ocr_service:app --host 127.0.0.1 --port 8010
+)
 goto :eof
 
 :error

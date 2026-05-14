@@ -4,15 +4,12 @@ import secrets
 from pathlib import Path
 from typing import Optional
 
-import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 from config_app import (
     API_PREFIX,
     APP_VERSION,
-    OCR_SERVICE_TIMEOUT_SECONDS,
-    OCR_SERVICE_URL,
     UPGRADE_STORE_DIR,
     get_admin_basic_password,
     get_admin_basic_user,
@@ -23,6 +20,7 @@ from models import (
     AgentConfigResponse,
     AgentHeartbeatRequest,
     AgentRegisterRequest,
+    AssetDiscoveryRequest,
     BatchEventItem,
     DetectionRuleCreateRequest,
     DetectionRuleUpdateRequest,
@@ -41,9 +39,12 @@ from detection.rules import (
     list_detection_rules,
     update_detection_rule,
 )
+from grpc_upload_server import check_grpc_health
 from services import (
     authenticate_agent,
+    check_ocr_service_health,
     get_admin_global_config,
+    get_asset_network_context,
     get_agent_config,
     get_file_detail,
     heartbeat,
@@ -52,6 +53,7 @@ from services import (
     list_admin_events,
     list_admin_agents,
     list_admin_assets,
+    list_discovered_assets,
     list_admin_files,
     list_admin_upload_sessions,
     list_admin_upgrade_reports,
@@ -61,6 +63,8 @@ from services import (
     refresh_admin_assets,
     report_upgrade,
     retry_task_failure,
+    run_asset_discovery,
+    save_agent_upgrade_package,
     update_global_config,
     upload_chunk,
     get_upload_status,
@@ -70,13 +74,14 @@ from tasks import submit_discovery_task
 from tracked_files import (
     get_sensitive_file_history,
     get_sensitive_version_detail,
-    get_version_artifact_path,
+    get_version_artifact_info,
     list_sensitive_files,
 )
 
 
 router = APIRouter(prefix=API_PREFIX, tags=["server-v2"])
 rules_alias_router = APIRouter(prefix="/api", tags=["rules"])
+assets_alias_router = APIRouter(prefix="/api", tags=["assets"])
 
 
 def _extract_token(authorization: Optional[str], x_agent_token: Optional[str]) -> str:
@@ -307,6 +312,36 @@ def admin_assets_refresh_endpoint(_=Depends(require_admin_auth)):
     return refresh_admin_assets()
 
 
+@router.get("/assets")
+def assets_endpoint():
+    return list_discovered_assets()
+
+
+@router.post("/assets/discover")
+def assets_discover_endpoint(req: AssetDiscoveryRequest):
+    return run_asset_discovery(req.model_dump())
+
+
+@router.get("/assets/context")
+def assets_context_endpoint():
+    return get_asset_network_context()
+
+
+@assets_alias_router.get("/assets")
+def assets_alias_endpoint():
+    return assets_endpoint()
+
+
+@assets_alias_router.post("/assets/discover")
+def assets_discover_alias_endpoint(req: AssetDiscoveryRequest):
+    return assets_discover_endpoint(req)
+
+
+@assets_alias_router.get("/assets/context")
+def assets_context_alias_endpoint():
+    return assets_context_endpoint()
+
+
 @router.get("/admin/files")
 def admin_files_endpoint(sensitive: bool = False, agent_id: Optional[str] = None, _=Depends(require_admin_auth)):
     return {"items": list_admin_files(sensitive, agent_id)}
@@ -329,20 +364,12 @@ def admin_upgrades_endpoint(limit: int = 100, _=Depends(require_admin_auth)):
 
 @router.get("/admin/ocr/health")
 def admin_ocr_health_endpoint(_=Depends(require_admin_auth)):
-    try:
-        with httpx.Client(timeout=OCR_SERVICE_TIMEOUT_SECONDS) as client:
-            response = client.get(f"{OCR_SERVICE_URL}/health")
-            response.raise_for_status()
-            data = response.json()
-        healthy = data.get("status") == "ok" and data.get("ready") is not False and not data.get("init_error")
-        return {
-            "status": "ok" if healthy else "error",
-            "service_url": OCR_SERVICE_URL,
-            "health": data,
-            "error": data.get("init_error") if not healthy else None,
-        }
-    except Exception as exc:
-        return {"status": "error", "service_url": OCR_SERVICE_URL, "error": str(exc)}
+    return check_ocr_service_health()
+
+
+@router.get("/admin/grpc/health")
+def admin_grpc_health_endpoint(_=Depends(require_admin_auth)):
+    return check_grpc_health()
 
 
 @router.get("/admin/files/{file_hash}")
@@ -374,12 +401,27 @@ def admin_task_failure_retry_endpoint(failure_id: int, _=Depends(require_admin_a
 
 @router.put("/admin/configs")
 def admin_update_configs_endpoint(req: AdminConfigUpdateRequest, _=Depends(require_admin_auth)):
-    return update_global_config(req.model_dump())
+    return update_global_config(req.model_dump(exclude_unset=True))
 
 
 @router.get("/admin/configs")
 def admin_get_configs_endpoint(_=Depends(require_admin_auth)):
     return get_admin_global_config()
+
+
+@router.post("/admin/upgrades/upload")
+async def admin_upload_upgrade_endpoint(
+    file: UploadFile = File(...),
+    version: Optional[str] = Form(default=None),
+    _=Depends(require_admin_auth),
+):
+    if not Path(file.filename or "").name.lower().endswith(".exe"):
+        raise HTTPException(status_code=400, detail="only .exe files are allowed")
+    try:
+        content = await file.read()
+        return save_agent_upgrade_package(file.filename or "SafeGuardAgent.exe", content, version=version)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/rules")
@@ -486,13 +528,15 @@ def sensitive_file_version_detail_endpoint(tracked_file_id: str, version_id: str
 
 def _artifact_response(tracked_file_id: str, version_id: str, artifact: str):
     try:
-        path = get_version_artifact_path(tracked_file_id, version_id, artifact)
+        info = get_version_artifact_info(tracked_file_id, version_id, artifact)
+        path = info["path"]
+        filename = info["filename"]
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     media_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-    return FileResponse(str(path), filename=path.name, media_type=media_type)
+    return FileResponse(str(path), filename=filename, media_type=media_type)
 
 
 @router.get("/sensitive-files/{tracked_file_id}/versions/{version_id}/download")

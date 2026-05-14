@@ -15,8 +15,15 @@ if "%SAFEGUARD_ADMIN_TOKEN%"=="" (
   set SAFEGUARD_ADMIN_TOKEN=dev-admin-token
 )
 
+if "%SAFEGUARD_LLM_PROVIDER%"=="" (
+  set SAFEGUARD_LLM_PROVIDER=qwen
+)
+
 echo Starting SafeGuard server in development-compatible mode.
 echo Admin token: %SAFEGUARD_ADMIN_TOKEN%
+if "%SAFEGUARD_LLM_API_KEY%"=="" (
+  echo LLM API key is not set. Set SAFEGUARD_LLM_API_KEY to enable LLM review.
+)
 echo Set SAFEGUARD_REQUIRE_PRODUCTION_DEPS=true to require PostgreSQL/Redis/MinIO.
 
 "%PYTHON_EXE%" -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload

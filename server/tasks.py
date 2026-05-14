@@ -1,3 +1,5 @@
+import concurrent.futures
+
 from celery import Celery
 
 from config_app import (
@@ -48,6 +50,19 @@ celery_app.conf.beat_schedule = {
 }
 
 
+_local_discovery_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="discovery")
+
+
+def _run_local_discovery_task(file_hash: str):
+    try:
+        return run_discovery_pipeline(file_hash)
+    except Exception as e:
+        record_task_failure("tasks.discovery_task", {"file_hash": file_hash}, str(e))
+        raise
+    finally:
+        redis_cache.delete(f"discovery:queued:{file_hash}")
+
+
 @celery_app.task(name="tasks.discovery_task", bind=True, autoretry_for=(Exception,), retry_backoff=True, retry_kwargs={"max_retries": 3})
 def discovery_task(self, file_hash: str):
     try:
@@ -91,6 +106,9 @@ def submit_discovery_task(file_hash: str, priority: str = "MEDIUM"):
     task_id = f"discovery:{file_hash}"
     lock_key = f"discovery:queued:{file_hash}"
     if not redis_cache.setnx(lock_key, task_id, 3600):
+        return task_id
+    if CELERY_BROKER_URL == "memory://":
+        _local_discovery_executor.submit(_run_local_discovery_task, file_hash)
         return task_id
     task = discovery_task.apply_async(
         args=[file_hash],

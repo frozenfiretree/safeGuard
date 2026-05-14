@@ -10,7 +10,7 @@ from typing import Dict, List, Optional
 
 
 SUPPORTED_EXTENSIONS = {
-    ".txt", ".csv", ".doc", ".docx", ".pdf", ".xlsx", ".pptx",
+    ".txt", ".csv", ".doc", ".docx", ".pdf", ".xlsx", ".ppt", ".pptx",
     ".png", ".jpg", ".jpeg", ".bmp",
 }
 
@@ -219,10 +219,13 @@ def _extract_pdf(path: Path) -> Dict:
     text_blocks = []
     image_blocks = []
     pages_without_text = 0
+    pages_with_text = 0
+    page_count = len(doc)
 
     for page_idx, page in enumerate(doc, start=1):
         text = (page.get_text("text") or "").strip()
         if text:
+            pages_with_text += 1
             for line_idx, line in enumerate(text.splitlines(), start=1):
                 line = line.strip()
                 if line:
@@ -241,29 +244,45 @@ def _extract_pdf(path: Path) -> Dict:
                     )
             except Exception:
                 continue
+    if pages_with_text and pages_without_text:
+        pdf_type = "hybrid_pdf"
+    elif pages_with_text:
+        pdf_type = "text_pdf"
+    elif image_blocks:
+        pdf_type = "scanned_pdf"
+    else:
+        pdf_type = "empty_pdf"
 
     return {
         "text_blocks": text_blocks,
         "image_blocks": image_blocks,
         "needs_ocr": bool(image_blocks) or pages_without_text > 0,
+        "pdf_type": pdf_type,
+        "pdf_meta": {
+            "page_count": page_count,
+            "pages_with_text": pages_with_text,
+            "pages_without_text": pages_without_text,
+            "image_blocks": len(image_blocks),
+        },
         "pages_without_text": pages_without_text,
         "parse_status": "ok",
     }
 
 
-def _convert_doc_to_docx(path: Path) -> Optional[Path]:
+def _convert_office_file(path: Path, target_extension: str, temp_prefix: str) -> Optional[Path]:
     soffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not soffice:
         return None
 
-    temp_dir = Path(tempfile.mkdtemp(prefix="safeguard_doc_"))
+    target_extension = target_extension.lower().lstrip(".")
+    temp_dir = Path(tempfile.mkdtemp(prefix=temp_prefix))
     try:
         proc = subprocess.run(
             [
                 soffice,
                 "--headless",
                 "--convert-to",
-                "docx",
+                target_extension,
                 "--outdir",
                 str(temp_dir),
                 str(path),
@@ -277,7 +296,7 @@ def _convert_doc_to_docx(path: Path) -> Optional[Path]:
         if proc.returncode != 0:
             shutil.rmtree(temp_dir, ignore_errors=True)
             return None
-        out_path = temp_dir / f"{path.stem}.docx"
+        out_path = temp_dir / f"{path.stem}.{target_extension}"
         if out_path.exists():
             return out_path
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -285,6 +304,14 @@ def _convert_doc_to_docx(path: Path) -> Optional[Path]:
     except Exception:
         shutil.rmtree(temp_dir, ignore_errors=True)
         return None
+
+
+def _convert_doc_to_docx(path: Path) -> Optional[Path]:
+    return _convert_office_file(path, "docx", "safeguard_doc_")
+
+
+def _convert_ppt_to_pptx(path: Path) -> Optional[Path]:
+    return _convert_office_file(path, "pptx", "safeguard_ppt_")
 
 
 def _extract_doc(path: Path) -> Dict:
@@ -300,6 +327,24 @@ def _extract_doc(path: Path) -> Dict:
     try:
         out = _extract_docx(converted)
         out["converted_from_doc"] = True
+        return out
+    finally:
+        shutil.rmtree(converted.parent, ignore_errors=True)
+
+
+def _extract_ppt(path: Path) -> Dict:
+    converted = _convert_ppt_to_pptx(path)
+    if not converted:
+        return {
+            "text_blocks": [],
+            "image_blocks": [],
+            "needs_ocr": False,
+            "parse_status": "unsupported_ppt_conversion",
+        }
+
+    try:
+        out = _extract_pptx(converted)
+        out["converted_from_ppt"] = True
         return out
     finally:
         shutil.rmtree(converted.parent, ignore_errors=True)
@@ -339,6 +384,8 @@ def extract_file_content(path: Path) -> Dict:
             return _extract_pdf(path)
         if ext == ".doc":
             return _extract_doc(path)
+        if ext == ".ppt":
+            return _extract_ppt(path)
         if ext in IMAGE_EXTENSIONS:
             return _extract_image(path)
     except Exception as e:

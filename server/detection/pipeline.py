@@ -183,6 +183,19 @@ def build_detection_result(
     llm_findings = llm_result.get("llm_findings", [])
     needs_ocr = bool(parse_result.get("needs_ocr", False))
     ocr_error = ocr_result.get("ocr_error")
+    highlight_metadata = {
+        "file_extension": (file_meta.get("extension") or "").lower(),
+        "pdf_type": parse_result.get("pdf_type"),
+        "pdf_meta": parse_result.get("pdf_meta") or {},
+        "text_hit_count": len(rule_findings),
+        "ocr_hit_count": len(ocr_findings),
+        "llm_hit_count": len(llm_findings),
+        "ocr_boxes": [
+            {"location": item.get("location"), "bbox": item.get("bbox")}
+            for item in ocr_findings
+            if item.get("bbox")
+        ],
+    }
     risk_level = calculate_risk_level(rule_findings, ocr_findings, llm_findings, needs_ocr, ocr_error)
     final_decision = build_final_decision(rule_findings, ocr_findings, llm_findings, risk_level, llm_result)
     per_block_locations = []
@@ -241,6 +254,9 @@ def build_detection_result(
         "confidence": final_decision.get("confidence"),
         "final_confidence": final_decision.get("confidence"),
         "per_block_locations": per_block_locations,
+        "highlight_metadata": highlight_metadata,
+        "pdf_type": parse_result.get("pdf_type"),
+        "pdf_meta": parse_result.get("pdf_meta") or {},
         "parsed_block_count": len(parse_result.get("text_blocks", [])),
         "image_block_count": len(parse_result.get("image_blocks", [])),
         "generated_at": int(time.time()),
@@ -296,7 +312,12 @@ def _ocr_rule_applies(rule: Dict, file_extension: str) -> bool:
     allowed = [str(item).lower().lstrip(".") for item in (rule.get("config") or {}).get("apply_file_types") or []]
     if not allowed:
         return True
-    return str(file_extension or "").lower().lstrip(".") in allowed
+    current = str(file_extension or "").lower().lstrip(".")
+    if current == "doc" and "docx" in allowed:
+        return True
+    if current == "ppt" and "pptx" in allowed:
+        return True
+    return current in allowed
 
 
 def write_detection_result(result_dir: Path, result: Dict) -> Path:

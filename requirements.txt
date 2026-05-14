@@ -12,6 +12,7 @@ python-pptx
 PyMuPDF
 Pillow
 paddleocr
+paddlepaddle
 opencv-python
 numpy
 matplotlib
@@ -23,3 +24,4 @@ minio
 psycopg2-binary
 grpcio
 grpcio-tools
+psutil

@@ -12,7 +12,7 @@ import winreg
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Iterable, List
+from typing import Any, Iterable, List, Sequence
 
 
 AGENT_VERSION = "2.0.0"
@@ -22,15 +22,44 @@ SERVICE_DESCRIPTION = "Collects file metadata and uploads files for server-side 
 
 PROGRAM_DATA_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "SafeGuardAgent"
 DEFAULT_SERVER_BASE = "http://192.168.175.1:8000"
-INSTALL_CONFIG_PATH = Path(
-    os.environ.get("SAFEGUARD_AGENT_SETTINGS_FILE", str(PROGRAM_DATA_DIR / "install_config.json"))
-)
 
 
-def load_install_settings() -> dict:
+@dataclass
+class AgentBaseConfig:
+    server_base: str
+    grpc_upload_target: str
+    work_dir: Path
+    install_config_path: Path
+    packaged_defaults_path: Path
+    field_sources: dict[str, str] = field(default_factory=dict)
+    conflicts: list[dict[str, Any]] = field(default_factory=list)
+
+    def as_safe_dict(self) -> dict:
+        return {
+            "server_base": self.server_base,
+            "grpc_upload_target": self.grpc_upload_target,
+            "work_dir": str(self.work_dir),
+            "install_config_path": str(self.install_config_path),
+            "packaged_defaults_path": str(self.packaged_defaults_path),
+            "field_sources": dict(self.field_sources),
+            "conflicts": list(self.conflicts),
+        }
+
+
+def _service_exe_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+    return Path(__file__).resolve().parents[1] / "agent.py"
+
+
+def _packaged_defaults_path() -> Path:
+    return _service_exe_path().with_name("agent-install.json")
+
+
+def _read_json_settings(path: Path) -> dict:
     try:
-        if INSTALL_CONFIG_PATH.exists():
-            data = json.loads(INSTALL_CONFIG_PATH.read_text(encoding="utf-8"))
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
                 return data
     except Exception:
@@ -38,17 +67,149 @@ def load_install_settings() -> dict:
     return {}
 
 
-INSTALL_SETTINGS = load_install_settings()
-SERVER_BASE = os.environ.get(
-    "SAFEGUARD_SERVER_BASE",
-    str(INSTALL_SETTINGS.get("server_base") or DEFAULT_SERVER_BASE),
-).rstrip("/")
+def _cli_options(argv: Sequence[str] | None = None) -> dict[str, str]:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    result: dict[str, str] = {}
+    flag_map = {
+        "--server-base": "server_base",
+        "--server-ip": "server_ip",
+        "--work-dir": "work_dir",
+        "--grpc-upload-target": "grpc_upload_target",
+        "--settings-file": "install_config_path",
+    }
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item in flag_map and index + 1 < len(argv):
+            result[flag_map[item]] = argv[index + 1]
+            index += 2
+            continue
+        index += 1
+    return result
+
+
+def server_base_from_ip(value: str) -> str:
+    raw = str(value or "").strip().strip('"').rstrip("/")
+    if not raw:
+        return ""
+    if "://" in raw:
+        return raw.rstrip("/")
+    if ":" in raw:
+        return f"http://{raw}".rstrip("/")
+    return f"http://{raw}:8000"
+
+
+def _pick_setting(
+    field: str,
+    candidates: list[tuple[str, Any]],
+    default: Any,
+) -> tuple[Any, str, list[dict[str, Any]]]:
+    present = [(source, value) for source, value in candidates if value not in (None, "")]
+    if not present:
+        return default, "default", []
+    chosen_source, chosen_value = present[0]
+    conflicts = []
+    for source, value in present[1:]:
+        if str(value) != str(chosen_value):
+            conflicts.append(
+                {
+                    "field": field,
+                    "effective_source": chosen_source,
+                    "ignored_source": source,
+                    "effective_value": str(chosen_value),
+                    "ignored_value": str(value),
+                }
+            )
+    return chosen_value, chosen_source, conflicts
+
+
+def _default_grpc_target(server_base: str) -> str:
+    parsed_server = urlparse(server_base if "://" in server_base else f"http://{server_base}")
+    return f"{parsed_server.hostname or '127.0.0.1'}:50051"
+
+
+def default_grpc_target(server_base: str) -> str:
+    return _default_grpc_target(server_base)
+
+
+def resolve_agent_base_config(argv: Sequence[str] | None = None) -> AgentBaseConfig:
+    cli = _cli_options(argv)
+    default_install_path = PROGRAM_DATA_DIR / "install_config.json"
+    install_config_path = Path(
+        cli.get("install_config_path")
+        or os.environ.get("SAFEGUARD_AGENT_SETTINGS_FILE")
+        or default_install_path
+    )
+    install_settings = _read_json_settings(install_config_path)
+    packaged_defaults_path = _packaged_defaults_path()
+    packaged_settings = _read_json_settings(packaged_defaults_path)
+
+    field_sources: dict[str, str] = {
+        "install_config_path": "cli" if cli.get("install_config_path") else ("env" if os.environ.get("SAFEGUARD_AGENT_SETTINGS_FILE") else "default"),
+        "packaged_defaults_path": "default",
+    }
+    conflicts: list[dict[str, Any]] = []
+
+    cli_server_base = cli.get("server_base") or server_base_from_ip(cli.get("server_ip") or "")
+    server_base, source, found_conflicts = _pick_setting(
+        "server_base",
+        [
+            ("cli", cli_server_base),
+            ("env", os.environ.get("SAFEGUARD_SERVER_BASE")),
+            ("install_config", install_settings.get("server_base")),
+            ("packaged_defaults", packaged_settings.get("server_base")),
+        ],
+        DEFAULT_SERVER_BASE,
+    )
+    server_base = str(server_base).rstrip("/")
+    field_sources["server_base"] = source
+    conflicts.extend(found_conflicts)
+
+    work_dir, source, found_conflicts = _pick_setting(
+        "work_dir",
+        [
+            ("cli", cli.get("work_dir")),
+            ("env", os.environ.get("SAFEGUARD_AGENT_WORKDIR")),
+            ("install_config", install_settings.get("work_dir")),
+            ("packaged_defaults", packaged_settings.get("work_dir")),
+        ],
+        str(PROGRAM_DATA_DIR),
+    )
+    work_dir = Path(str(work_dir))
+    field_sources["work_dir"] = source
+    conflicts.extend(found_conflicts)
+
+    grpc_upload_target, source, found_conflicts = _pick_setting(
+        "grpc_upload_target",
+        [
+            ("cli", cli.get("grpc_upload_target")),
+            ("env", os.environ.get("SAFEGUARD_GRPC_UPLOAD_TARGET")),
+            ("install_config", install_settings.get("grpc_upload_target")),
+            ("packaged_defaults", packaged_settings.get("grpc_upload_target")),
+        ],
+        _default_grpc_target(server_base),
+    )
+    grpc_upload_target = str(grpc_upload_target).strip()
+    field_sources["grpc_upload_target"] = source
+    conflicts.extend(found_conflicts)
+
+    return AgentBaseConfig(
+        server_base=server_base,
+        grpc_upload_target=grpc_upload_target,
+        work_dir=work_dir,
+        install_config_path=install_config_path,
+        packaged_defaults_path=packaged_defaults_path,
+        field_sources=field_sources,
+        conflicts=conflicts,
+    )
+
+
+EFFECTIVE_AGENT_CONFIG = resolve_agent_base_config()
+INSTALL_CONFIG_PATH = EFFECTIVE_AGENT_CONFIG.install_config_path
+INSTALL_SETTINGS = _read_json_settings(INSTALL_CONFIG_PATH)
+SERVER_BASE = EFFECTIVE_AGENT_CONFIG.server_base
 API_V1_BASE = f"{SERVER_BASE}/api/v1"
-_parsed_server = urlparse(SERVER_BASE if "://" in SERVER_BASE else f"http://{SERVER_BASE}")
-GRPC_UPLOAD_TARGET = os.environ.get(
-    "SAFEGUARD_GRPC_UPLOAD_TARGET",
-    f"{_parsed_server.hostname or '127.0.0.1'}:50051",
-).strip()
+GRPC_UPLOAD_TARGET = EFFECTIVE_AGENT_CONFIG.grpc_upload_target
 
 REGISTER_URL = f"{API_V1_BASE}/agents/register"
 AGENT_CONFIG_URL_TEMPLATE = f"{API_V1_BASE}/agents/{{agent_id}}/config"
@@ -63,9 +224,7 @@ UPGRADE_REPORT_URL_TEMPLATE = f"{API_V1_BASE}/agents/{{agent_id}}/upgrade-report
 UPGRADE_DOWNLOAD_URL_TEMPLATE = f"{API_V1_BASE}/upgrades/{{version}}/download"
 ARTIFACT_URL_TEMPLATE = f"{SERVER_BASE}/api/artifacts/{{artifact_id}}"
 
-WORK_DIR = Path(
-    os.environ.get("SAFEGUARD_AGENT_WORKDIR", str(INSTALL_SETTINGS.get("work_dir") or PROGRAM_DATA_DIR))
-)
+WORK_DIR = EFFECTIVE_AGENT_CONFIG.work_dir
 LOG_DIR = WORK_DIR / "logs"
 DB_PATH = WORK_DIR / "agent.db"
 LOG_FILE = LOG_DIR / "agent.log"
@@ -86,6 +245,8 @@ TEMP_FILE_PATTERNS = [
     re.compile(r"^~lock\..+", re.IGNORECASE),
     re.compile(r".+\.tmp$", re.IGNORECASE),
     re.compile(r".+\.temp$", re.IGNORECASE),
+    re.compile(r".+\.crdownload$", re.IGNORECASE),
+    re.compile(r"^未确认\s+\d+\.crdownload$", re.IGNORECASE),
 ]
 
 
@@ -133,6 +294,10 @@ def setup_logging(name: str = "agent") -> logging.Logger:
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     return logger
+
+
+def agent_config_diagnostics() -> dict:
+    return resolve_agent_base_config().as_safe_dict()
 
 
 def now_iso() -> str:

@@ -10,6 +10,8 @@ import uuid
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import httpx
+
 from config_app import (
     APP_VERSION,
     DATA_DIR,
@@ -20,6 +22,8 @@ from config_app import (
     TOKEN_REFRESH_THRESHOLD_SECONDS,
     TOKEN_TTL_SECONDS,
     UPLOAD_SESSION_TTL_SECONDS,
+    OCR_SERVICE_TIMEOUT_SECONDS,
+    OCR_SERVICE_URL,
     UploadSessionStatus,
     AgentStatus,
     FileDetectionStatus,
@@ -43,6 +47,7 @@ from models import (
 from path_utils import remote_path_name
 from storage import db_session, init_db, object_storage, redis_cache
 from tracked_files import archive_sensitive_file, ingest_tracked_event
+from asset_discovery import discover_assets, get_local_network_context, infer_candidate_networks
 
 
 logger = setup_app_logger("services")
@@ -50,6 +55,56 @@ logger = setup_app_logger("services")
 
 def _now() -> float:
     return time.time()
+
+
+def check_ocr_service_health() -> dict:
+    started = time.time()
+    base = {
+        "status": "error",
+        "service": "ocr",
+        "service_url": OCR_SERVICE_URL,
+        "service_alive": False,
+        "latency_ms": None,
+        "ready": False,
+        "models_ok": False,
+        "ocr_initialized": False,
+        "warmup_completed": False,
+        "runtime_device": None,
+        "missing_items": [],
+        "health": None,
+        "error": None,
+    }
+    try:
+        with httpx.Client(timeout=OCR_SERVICE_TIMEOUT_SECONDS) as client:
+            response = client.get(f"{OCR_SERVICE_URL}/status")
+            if response.status_code == 404:
+                response = client.get(f"{OCR_SERVICE_URL}/health")
+            response.raise_for_status()
+            data = response.json()
+        latency_ms = int((time.time() - started) * 1000)
+        init_error = data.get("init_error") or data.get("error")
+        ready = bool(data.get("ready", data.get("status") == "ok") and data.get("models_ok", True) and not init_error)
+        return {
+            **base,
+            "status": "ok" if ready else "error",
+            "service_alive": True,
+            "latency_ms": latency_ms,
+            "ready": ready,
+            "models_ok": bool(data.get("models_ok", ready)),
+            "ocr_initialized": bool(data.get("ocr_initialized") or data.get("model_loaded")),
+            "warmup_completed": bool(data.get("warmup_completed")),
+            "warmup_in_progress": bool(data.get("warmup_in_progress")),
+            "runtime_device": data.get("runtime_device"),
+            "gpu_requested": data.get("gpu_requested"),
+            "gpu_enabled": data.get("gpu_enabled"),
+            "missing_items": data.get("missing_items") or data.get("model_integrity", {}).get("missing_items") or [],
+            "model_home": data.get("model_home") or data.get("model_integrity", {}).get("model_home"),
+            "health": data,
+            "error": init_error if not ready else None,
+        }
+    except Exception as exc:
+        latency_ms = int((time.time() - started) * 1000)
+        return {**base, "latency_ms": latency_ms, "error": str(exc)}
 
 
 def _hash_token(token: str) -> str:
@@ -88,7 +143,7 @@ def _default_config_payload(version: int, watch_dirs: Optional[List[str]] = None
     return {
         "config_version": version,
         "scan_dirs": scan_dirs,
-        "include_extensions": [".docx", ".xlsx", ".pdf", ".pptx", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".bmp"],
+        "include_extensions": [".doc", ".docx", ".xlsx", ".pdf", ".ppt", ".pptx", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".bmp"],
         "exclude_paths": exclude_paths,
         "max_file_size_mb": 100,
         "heartbeat_interval_sec": 60,
@@ -108,7 +163,16 @@ def _sanitize_agent_config_payload(payload: Optional[dict], version: int) -> tup
     if not watch_dirs or any(_has_legacy_broad_watch(item) for item in watch_dirs):
         current["watch_dirs"] = _restricted_agent_dirs()
         changed = True
-    current.setdefault("include_extensions", [".docx", ".xlsx", ".pdf", ".pptx", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".bmp"])
+    current.setdefault("include_extensions", [".doc", ".docx", ".xlsx", ".pdf", ".ppt", ".pptx", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".bmp"])
+    include_extensions = [str(item).lower() for item in current.get("include_extensions") or []]
+    if ".doc" not in include_extensions:
+        include_extensions.append(".doc")
+        current["include_extensions"] = include_extensions
+        changed = True
+    if ".ppt" not in include_extensions:
+        include_extensions.append(".ppt")
+        current["include_extensions"] = include_extensions
+        changed = True
     current.setdefault("exclude_paths", _default_config_payload(version).get("exclude_paths", []))
     if int(current.get("config_version") or 0) != int(version):
         current["config_version"] = version
@@ -145,6 +209,79 @@ def _sanitize_upgrade_payload(upgrade: Optional[dict]) -> Optional[dict]:
     if any(path.exists() for path in candidates):
         return upgrade
     return None
+
+
+SUSPICIOUS_LLM_SOURCE_TOKENS = [
+    "\\downloads\\",
+    "\\desktop\\",
+    "\\documents\\",
+    "\\wechat files\\",
+    "\\temp\\",
+    "/downloads/",
+    "/desktop/",
+    "/documents/",
+    "/tmp/",
+]
+
+
+def _is_suspicious_llm_source_path(path: str) -> bool:
+    lowered = str(path or "").replace("/", "\\").lower()
+    lowered_slash = str(path or "").replace("\\", "/").lower()
+    return any(token in lowered or token in lowered_slash for token in SUSPICIOUS_LLM_SOURCE_TOKENS)
+
+
+def _select_llm_source_path(session, file_hash: str, fallback: str) -> str:
+    rows = session.query(FileVersion).filter(
+        FileVersion.file_hash == file_hash,
+        FileVersion.is_current.is_(True),
+    ).all()
+    paths = [str(row.file_path or "") for row in rows if row.file_path]
+    suspicious = [path for path in paths if _is_suspicious_llm_source_path(path)]
+    if suspicious:
+        return sorted(suspicious, key=lambda item: (len(item), item.lower()))[0]
+    return paths[0] if paths else fallback
+
+
+def _should_rediscover_for_suspicious_source(session, file_hash: str) -> bool:
+    file_row = session.get(FileRecord, file_hash)
+    parse_row = session.get(ParseResult, file_hash)
+    if not file_row or not parse_row:
+        return False
+    if file_row.detection_status not in {FileDetectionStatus.NON_SENSITIVE.value, FileDetectionStatus.SENSITIVE.value}:
+        return False
+    data = parse_row.result_data or {}
+    if data.get("llm_gate_reason") != "source_not_suspicious":
+        return False
+    selected_path = _select_llm_source_path(session, file_hash, data.get("file_path") or file_row.file_name or "")
+    return _is_suspicious_llm_source_path(selected_path)
+
+
+def save_agent_upgrade_package(filename: str, content: bytes, version: Optional[str] = None) -> dict:
+    safe_name = Path(str(filename or "")).name
+    if not safe_name.lower().endswith(".exe"):
+        raise ValueError("only .exe upgrade packages are allowed")
+    if not content:
+        raise ValueError("upgrade package is empty")
+    raw_version = str(version or "").strip()
+    if not raw_version:
+        raw_version = Path(safe_name).stem
+    raw_version = re.sub(r"(?i)^SafeGuardAgent[-_ ]*", "", raw_version).strip()
+    raw_version = re.sub(r"[^0-9A-Za-z._-]+", "-", raw_version).strip(".-_")
+    if not raw_version:
+        raw_version = str(int(_now()))
+    checksum = hashlib.sha256(content).hexdigest().lower()
+    package_dir = UPGRADE_STORE_DIR / raw_version
+    package_dir.mkdir(parents=True, exist_ok=True)
+    package_path = package_dir / "SafeGuardAgent.exe"
+    package_path.write_bytes(content)
+    return {
+        "status": "ok",
+        "version": raw_version,
+        "checksum": checksum,
+        "file_name": package_path.name,
+        "size": len(content),
+        "path": str(package_path),
+    }
 
 
 def ensure_global_config() -> AgentConfig:
@@ -441,6 +578,9 @@ def get_upload_status(session_id: str) -> dict:
 
 
 def complete_upload_session(session_id: str, priority: str = "MEDIUM") -> dict:
+    cleanup_chunks = 0
+    temp_path = None
+    temp_object = f"uploads/{session_id}/merged"
     with db_session() as session:
         row = session.get(UploadSession, session_id)
         if not row:
@@ -453,58 +593,92 @@ def complete_upload_session(session_id: str, priority: str = "MEDIUM") -> dict:
         if missing:
             raise RuntimeError(f"missing chunks: {missing}")
 
+        upload_info = {
+            "agent_id": row.agent_id,
+            "file_hash": row.file_hash,
+            "file_name": row.file_name,
+            "file_type": row.file_type,
+            "file_path": row.file_path,
+            "file_size": row.file_size,
+            "total_chunks": int(row.total_chunks),
+        }
         row.status = UploadSessionStatus.COMPLETING.value
         row.updated_at = _now()
 
-        temp_object = f"uploads/{session_id}/merged"
-        object_storage.compose_chunks(session_id, int(row.total_chunks), temp_object)
+    try:
+        object_storage.compose_chunks(session_id, upload_info["total_chunks"], temp_object)
         temp_path = object_storage.download_to_temp(temp_object)
         actual_hash = hashlib.sha256(temp_path.read_bytes()).hexdigest()
-        if actual_hash.lower() != row.file_hash.lower():
-            row.status = UploadSessionStatus.FAILED.value
-            raise RuntimeError(f"file hash mismatch: expected={row.file_hash}, actual={actual_hash}")
+        if actual_hash.lower() != upload_info["file_hash"].lower():
+            with db_session() as session:
+                row = session.get(UploadSession, session_id)
+                if row:
+                    row.status = UploadSessionStatus.FAILED.value
+                    row.updated_at = _now()
+            raise RuntimeError(f"file hash mismatch: expected={upload_info['file_hash']}, actual={actual_hash}")
 
-        final_store_path = object_storage.upload_final_file(row.file_hash, temp_object)
+        final_store_path = object_storage.upload_final_file(upload_info["file_hash"], temp_object)
 
-        existing = session.get(FileRecord, row.file_hash)
-        if not existing:
-            existing = FileRecord(
-                file_hash=row.file_hash,
-                file_name=row.file_name,
-                file_type=row.file_type,
-                file_size=row.file_size,
-                store_path=final_store_path,
-                detection_status=FileDetectionStatus.RECEIVED.value,
+        with db_session() as session:
+            row = session.get(UploadSession, session_id)
+            if not row:
+                raise ValueError("upload session not found")
+
+            existing = session.get(FileRecord, upload_info["file_hash"])
+            if not existing:
+                existing = FileRecord(
+                    file_hash=upload_info["file_hash"],
+                    file_name=upload_info["file_name"],
+                    file_type=upload_info["file_type"],
+                    file_size=upload_info["file_size"],
+                    store_path=final_store_path,
+                    detection_status=FileDetectionStatus.RECEIVED.value,
+                )
+                session.add(existing)
+            else:
+                existing.file_name = upload_info["file_name"]
+                existing.file_type = upload_info["file_type"]
+                existing.file_size = upload_info["file_size"]
+                existing.store_path = final_store_path
+                existing.detection_status = FileDetectionStatus.RECEIVED.value
+                existing.updated_at = _now()
+
+            session.query(FileVersion).filter(
+                FileVersion.agent_id == upload_info["agent_id"],
+                FileVersion.file_path == upload_info["file_path"],
+                FileVersion.is_current.is_(True),
+            ).update({"is_current": False})
+            session.add(
+                FileVersion(
+                    agent_id=upload_info["agent_id"],
+                    file_path=upload_info["file_path"],
+                    file_hash=upload_info["file_hash"],
+                    is_current=True,
+                )
             )
-            session.add(existing)
-        else:
-            existing.file_name = row.file_name
-            existing.file_type = row.file_type
-            existing.file_size = row.file_size
-            existing.store_path = final_store_path
-            existing.detection_status = FileDetectionStatus.RECEIVED.value
-            existing.updated_at = _now()
 
-        session.query(FileVersion).filter(
-            FileVersion.agent_id == row.agent_id,
-            FileVersion.file_path == row.file_path,
-            FileVersion.is_current.is_(True),
-        ).update({"is_current": False})
-        session.add(FileVersion(agent_id=row.agent_id, file_path=row.file_path, file_hash=row.file_hash, is_current=True))
-
-        row.status = UploadSessionStatus.COMPLETED.value
-        row.updated_at = _now()
+            row.status = UploadSessionStatus.COMPLETED.value
+            row.updated_at = _now()
         redis_cache.delete(f"upload:{session_id}:chunks")
-
+        cleanup_chunks = upload_info["total_chunks"]
+    except Exception:
+        with db_session() as session:
+            row = session.get(UploadSession, session_id)
+            if row and row.status == UploadSessionStatus.COMPLETING.value:
+                row.status = UploadSessionStatus.FAILED.value
+                row.updated_at = _now()
+        raise
+    finally:
         try:
-            temp_path.unlink(missing_ok=True)
+            if temp_path:
+                temp_path.unlink(missing_ok=True)
         except Exception:
             pass
-        for idx in range(int(row.total_chunks)):
+        for idx in range(cleanup_chunks):
             object_storage.delete(f"uploads/{session_id}/chunk_{idx}")
         object_storage.delete(temp_object)
 
-        return {"status": "accepted", "session_id": session_id, "file_hash": row.file_hash, "priority": priority}
+    return {"status": "accepted", "session_id": session_id, "file_hash": upload_info["file_hash"], "priority": priority}
 
 
 def run_discovery_pipeline(file_hash: str) -> dict:
@@ -512,11 +686,13 @@ def run_discovery_pipeline(file_hash: str) -> dict:
         file_row = session.get(FileRecord, file_hash)
         if not file_row:
             raise ValueError("file not found")
+        llm_source_path = _select_llm_source_path(session, file_hash, file_row.file_name or file_hash)
+        allow_rediscover = _should_rediscover_for_suspicious_source(session, file_hash)
         if file_row.detection_status in {
             FileDetectionStatus.SENSITIVE.value,
             FileDetectionStatus.NON_SENSITIVE.value,
             FileDetectionStatus.PARSE_FAILED.value,
-        }:
+        } and not allow_rediscover:
             if file_row.detection_status == FileDetectionStatus.SENSITIVE.value:
                 try:
                     archive_sensitive_file(file_hash)
@@ -539,7 +715,7 @@ def run_discovery_pipeline(file_hash: str) -> dict:
             agent_id="server",
             scan_id=file_hash,
             file_meta={
-                "path": file_name,
+                "path": llm_source_path or file_name,
                 "size": file_size,
                 "extension": file_type or Path(file_name or "").suffix.lower(),
                 "sha256": file_hash,
@@ -708,6 +884,12 @@ def legacy_sync_upload(agent_id: str, scan_id: str, file_meta: dict, content: by
         }
     )
     if init_resp["status"] == "dedup":
+        try:
+            from tasks import submit_discovery_task
+
+            submit_discovery_task(file_meta["sha256"])
+        except Exception as exc:
+            logger.warning("legacy dedup discovery submit failed: file_hash=%s error=%s", file_meta["sha256"], exc)
         reused = get_detection_result_payload(file_meta["sha256"]) or {}
         return {"status": "ok", "reused": True, "result": reused}
 
@@ -1133,8 +1315,7 @@ def update_global_config(payload: dict) -> dict:
 
         merged = dict(config.config_data or {})
         for key, value in payload.items():
-            if value is not None:
-                merged[key] = value
+            merged[key] = value
         config.version = int(config.version) + 1
         merged["config_version"] = config.version
         config.config_data = merged
@@ -1159,6 +1340,12 @@ def _asset_cache_path() -> Path:
     asset_dir = DATA_DIR / "assets"
     asset_dir.mkdir(parents=True, exist_ok=True)
     return asset_dir / "discovered_hosts.json"
+
+
+def _asset_discovery_cache_path() -> Path:
+    asset_dir = DATA_DIR / "assets"
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    return asset_dir / "asset_discovery_latest.json"
 
 
 def _normalize_mac(value: Optional[str]) -> str:
@@ -1380,12 +1567,69 @@ def refresh_admin_assets() -> dict:
     existing = _read_json(cache_path, default=[])
     if isinstance(existing, dict):
         existing = existing.get("items", [])
-    local_items = _detect_local_hosts()
-    arp_items = _parse_arp_cache()
-    fresh = local_items + arp_items
+    result = discover_assets(include_port_scan=False, include_os_detect=True, timeout=20)
+    fresh = result.get("assets") or []
     merged = _merge_asset_records(existing or [], fresh)
     cache_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"items": merged, "updated_at": _now(), "sources": {"local_system": len(local_items), "arp_cache": len(arp_items)}}
+    discovery_cache = _asset_discovery_cache_path()
+    result["assets"] = merged
+    result["count"] = len(merged)
+    result["updated_at"] = _now()
+    discovery_cache.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "items": merged,
+        "updated_at": result["updated_at"],
+        "sources": {"asset_discovery": len(fresh)},
+        "warnings": result.get("warnings") or [],
+        "errors": result.get("errors") or [],
+        "platform": result.get("platform"),
+        "candidate_networks": result.get("candidate_networks") or [],
+        "local_interfaces": result.get("local_interfaces") or [],
+    }
+
+
+def list_discovered_assets() -> dict:
+    cache_path = _asset_discovery_cache_path()
+    if not cache_path.exists():
+        return {"status": "ok", "count": 0, "assets": [], "message": "asset discovery has not been run yet"}
+    data = _read_json(cache_path, default={})
+    if isinstance(data, list):
+        return {"status": "ok", "count": len(data), "assets": data}
+    assets = data.get("assets") or data.get("items") or []
+    data["assets"] = assets
+    data["count"] = len(assets)
+    data.setdefault("status", "ok")
+    return data
+
+
+def run_asset_discovery(payload: Optional[dict] = None) -> dict:
+    payload = payload or {}
+    result = discover_assets(
+        targets=payload.get("targets"),
+        mode=str(payload.get("mode") or "auto"),
+        include_port_scan=bool(payload.get("include_port_scan", True)),
+        include_os_detect=bool(payload.get("include_os_detect", True)),
+        timeout=int(payload.get("timeout") or 60),
+        ports=payload.get("ports"),
+    )
+    result["updated_at"] = _now()
+    _asset_discovery_cache_path().write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    _asset_cache_path().write_text(json.dumps(result.get("assets") or [], ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
+
+
+def get_asset_network_context() -> dict:
+    context = get_local_network_context()
+    candidates = infer_candidate_networks(context)
+    return {
+        "platform": context.get("platform"),
+        "local_interfaces": context.get("local_interfaces") or [],
+        "route_table": context.get("route_table") or [],
+        "extra_networks": context.get("extra_networks") or [],
+        "candidate_networks": candidates,
+        "warnings": context.get("warnings") or [],
+        "errors": context.get("errors") or [],
+    }
 
 
 def _iter_jsonl(path: Path):

@@ -1,5 +1,6 @@
 from concurrent import futures
 from typing import Optional
+import time
 
 import grpc
 
@@ -11,6 +12,9 @@ from tasks import submit_discovery_task
 
 logger = setup_app_logger("grpc_upload")
 GRPC_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+GRPC_SERVER_STATUS = "stopped"
+GRPC_SERVER_STARTED_AT: Optional[float] = None
+GRPC_SERVER_ERROR: Optional[str] = None
 
 
 def _grpc_error(code: grpc.StatusCode, message: str):
@@ -33,6 +37,11 @@ class UploadServiceServicer(safeguard_upload_pb2_grpc.UploadServiceServicer):
                     "file_path": request.file_path,
                 }
             )
+            if result.get("status") == "dedup":
+                try:
+                    submit_discovery_task(result["file_id"], priority=request.priority or "MEDIUM")
+                except Exception as exc:
+                    logger.warning("dedup discovery submit failed: file_hash=%s error=%s", result.get("file_id"), exc)
             return safeguard_upload_pb2.InitUploadResponse(
                 status=result.get("status", ""),
                 session_id=result.get("session_id", ""),
@@ -103,7 +112,69 @@ def build_grpc_server() -> grpc.Server:
 
 
 def start_grpc_server() -> grpc.Server:
+    global GRPC_SERVER_ERROR
+    global GRPC_SERVER_STARTED_AT
+    global GRPC_SERVER_STATUS
     server = build_grpc_server()
-    server.start()
-    logger.info("grpc upload server started at %s:%s", GRPC_UPLOAD_HOST, GRPC_UPLOAD_PORT)
-    return server
+    try:
+        server.start()
+        GRPC_SERVER_STATUS = "serving"
+        GRPC_SERVER_STARTED_AT = time.time()
+        GRPC_SERVER_ERROR = None
+        logger.info("grpc upload server started at %s:%s", GRPC_UPLOAD_HOST, GRPC_UPLOAD_PORT)
+        return server
+    except Exception as exc:
+        GRPC_SERVER_STATUS = "error"
+        GRPC_SERVER_ERROR = str(exc)
+        logger.exception("grpc upload server failed to start: %s", exc)
+        raise
+
+
+def _health_target() -> str:
+    host = GRPC_UPLOAD_HOST
+    if host in {"0.0.0.0", "::", ""}:
+        host = "127.0.0.1"
+    return f"{host}:{GRPC_UPLOAD_PORT}"
+
+
+def get_grpc_server_state() -> dict:
+    return {
+        "service": "grpc_upload",
+        "host": GRPC_UPLOAD_HOST,
+        "port": GRPC_UPLOAD_PORT,
+        "target": _health_target(),
+        "status": GRPC_SERVER_STATUS,
+        "started_at": GRPC_SERVER_STARTED_AT,
+        "error": GRPC_SERVER_ERROR,
+    }
+
+
+def mark_grpc_server_stopped() -> None:
+    global GRPC_SERVER_STATUS
+    GRPC_SERVER_STATUS = "stopped"
+
+
+def check_grpc_health(timeout_seconds: float = 2.0) -> dict:
+    started = time.time()
+    state = get_grpc_server_state()
+    try:
+        channel = grpc.insecure_channel(state["target"])
+        grpc.channel_ready_future(channel).result(timeout=timeout_seconds)
+        channel.close()
+        latency_ms = int((time.time() - started) * 1000)
+        return {
+            **state,
+            "status": "ok",
+            "serving": True,
+            "latency_ms": latency_ms,
+            "error": None,
+        }
+    except Exception as exc:
+        latency_ms = int((time.time() - started) * 1000)
+        return {
+            **state,
+            "status": "error",
+            "serving": False,
+            "latency_ms": latency_ms,
+            "error": state.get("error") or str(exc),
+        }

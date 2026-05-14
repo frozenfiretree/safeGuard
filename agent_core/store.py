@@ -244,6 +244,32 @@ class AgentStore:
                 (now_iso(),),
             )
 
+    def clear_runtime_state_for_server_switch(self):
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM task_queue")
+            conn.execute("DELETE FROM file_baseline")
+            conn.execute(
+                """
+                DELETE FROM agent_state
+                WHERE key IN (
+                    'agent_id',
+                    'token',
+                    'token_expires',
+                    'config_version',
+                    'config_json',
+                    'last_register_at',
+                    'last_register_result',
+                    'last_heartbeat_at',
+                    'last_heartbeat_payload',
+                    'last_heartbeat_result',
+                    'last_piggyback',
+                    'last_scan_path',
+                    'scan_completed',
+                    'current_state'
+                )
+                """
+            )
+
     def set_current_state(self, state: str):
         self.set_state("current_state", state)
 

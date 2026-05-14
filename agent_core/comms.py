@@ -4,26 +4,15 @@ import math
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
+import threading
 
 import grpc
 import requests
 
 from .config import (
-    AGENT_CONFIG_URL_TEMPLATE,
     AGENT_VERSION,
-    ARTIFACT_URL_TEMPLATE,
-    EVENT_BATCH_URL,
-    GRPC_UPLOAD_TARGET,
-    HEARTBEAT_URL_TEMPLATE,
-    REGISTER_URL,
-    SCAN_COMPLETE_URL_TEMPLATE,
-    UPGRADE_DOWNLOAD_URL_TEMPLATE,
-    UPGRADE_REPORT_URL_TEMPLATE,
-    UPLOAD_CHUNK_URL_TEMPLATE,
-    UPLOAD_COMPLETE_URL_TEMPLATE,
-    UPLOAD_INIT_URL,
-    UPLOAD_STATUS_URL_TEMPLATE,
     build_agent_identity,
+    resolve_agent_base_config,
 )
 from .grpc_proto import safeguard_upload_pb2, safeguard_upload_pb2_grpc
 from .store import AgentStore
@@ -35,12 +24,46 @@ class ServerClient:
         self.logger = logger
         self.request_timeout = request_timeout
         self.session = requests.Session()
-        self.grpc_target = GRPC_UPLOAD_TARGET
+        self.base_config = resolve_agent_base_config()
+        self.server_base = self.base_config.server_base
+        self.api_v1_base = f"{self.server_base}/api/v1"
+        self.grpc_target = self.base_config.grpc_upload_target
+        self._config_signature = self._base_config_signature()
+
+    def refresh_base_config(self) -> tuple[bool, bool]:
+        previous_server = self.server_base
+        previous_grpc = self.grpc_target
+        previous_signature = self._config_signature
+        self.base_config = resolve_agent_base_config()
+        self.server_base = self.base_config.server_base
+        self.api_v1_base = f"{self.server_base}/api/v1"
+        self.grpc_target = self.base_config.grpc_upload_target
+        self._config_signature = self._base_config_signature()
+        changed = self._config_signature != previous_signature
+        server_changed = self.server_base != previous_server or self.grpc_target != previous_grpc
+        if changed:
+            self.session.close()
+            self.session = requests.Session()
+            self.logger.info(
+                "agent server config refreshed: server_base=%s grpc_upload_target=%s server_changed=%s",
+                self.server_base,
+                self.grpc_target,
+                server_changed,
+            )
+        return changed, server_changed
+
+    def _base_config_signature(self) -> tuple[str, str, str]:
+        try:
+            config_mtime = str(self.base_config.install_config_path.stat().st_mtime_ns)
+        except OSError:
+            config_mtime = ""
+        return (self.server_base, self.grpc_target, config_mtime)
 
     def register(self) -> Dict:
+        self.refresh_base_config()
         cached_agent_id = self.store.get_state("agent_id")
         identity = build_agent_identity(cached_agent_id)
-        response = self.session.post(REGISTER_URL, json=identity, timeout=self.request_timeout)
+        response = self.session.post(self._register_url(), json=identity, timeout=self.request_timeout)
         response.raise_for_status()
         data = response.json()
         agent_id = str(data.get("agent_id") or cached_agent_id or identity["agent_id"])
@@ -68,6 +91,7 @@ class ServerClient:
         return data
 
     def heartbeat(self, state: str, config_version: str, pending_count: int) -> Dict:
+        self.refresh_base_config()
         agent_id = self._require_agent_id()
         payload = {
             "timestamp": time.time(),
@@ -78,7 +102,7 @@ class ServerClient:
         }
         data = self._request_json(
             "POST",
-            HEARTBEAT_URL_TEMPLATE.format(agent_id=agent_id),
+            self._heartbeat_url(agent_id),
             json_payload=payload,
             with_auth=True,
         )
@@ -89,6 +113,7 @@ class ServerClient:
         return data
 
     def fetch_config(self) -> Dict:
+        self.refresh_base_config()
         agent_id = self._require_agent_id()
         current_version = self.store.get_state("config_version")
         cached_config = self.store.get_json_state("config_json", None)
@@ -96,7 +121,7 @@ class ServerClient:
         if current_version and cached_config:
             params = {"config_version": int(current_version or 0)}
         response = self.session.get(
-            AGENT_CONFIG_URL_TEMPLATE.format(agent_id=agent_id),
+            self._agent_config_url(agent_id),
             params=params,
             headers=self._auth_headers(),
             timeout=self.request_timeout,
@@ -110,12 +135,16 @@ class ServerClient:
         return {"status": "ok", **data}
 
     def submit_events_batch(self, events: List[Dict]) -> Dict:
+        self.refresh_base_config()
         if not events:
             return {"accepted": 0, "duplicates": 0}
         payload = {"events": [self._event_payload(item) for item in events]}
-        return self._request_json("POST", EVENT_BATCH_URL, json_payload=payload, with_auth=True)
+        return self._request_json("POST", self._event_batch_url(), json_payload=payload, with_auth=True)
 
-    def submit_file(self, payload: Dict, chunk_size_bytes: int) -> Dict:
+    def submit_file(self, payload: Dict, chunk_size_bytes: int, stop_event: Optional[threading.Event] = None) -> Dict:
+        _, server_changed = self.refresh_base_config()
+        if server_changed:
+            raise RuntimeError("server config changed before upload")
         agent_id = self._require_agent_id()
         file_path = Path(payload["path"])
         if not file_path.exists():
@@ -168,6 +197,11 @@ class ServerClient:
             def chunk_iter():
                 with open(file_path, "rb") as handle:
                     for index in range(total_chunks):
+                        if stop_event and stop_event.is_set():
+                            raise RuntimeError("upload cancelled")
+                        _, changed_during_upload = self.refresh_base_config()
+                        if changed_during_upload:
+                            raise RuntimeError("server config changed during upload")
                         chunk = handle.read(chunk_size_bytes)
                         if index in uploaded_chunks:
                             continue
@@ -179,6 +213,8 @@ class ServerClient:
                         )
 
             stub.UploadChunks(chunk_iter(), timeout=max(self.request_timeout, 300))
+            if stop_event and stop_event.is_set():
+                raise RuntimeError("upload cancelled")
             complete_resp = stub.CompleteUpload(
                 safeguard_upload_pb2.CompleteUploadRequest(
                     session_id=session_id,
@@ -198,10 +234,11 @@ class ServerClient:
         }
 
     def submit_scan_complete(self, stats: Dict) -> Dict:
+        self.refresh_base_config()
         agent_id = self._require_agent_id()
         return self._request_json(
             "POST",
-            SCAN_COMPLETE_URL_TEMPLATE.format(agent_id=agent_id),
+            self._scan_complete_url(agent_id),
             json_payload={
                 "total_files": int(stats.get("total_files") or 0),
                 "scanned": int(stats.get("scanned") or 0),
@@ -215,18 +252,20 @@ class ServerClient:
         )
 
     def report_upgrade_result(self, payload: Dict) -> Dict:
+        self.refresh_base_config()
         agent_id = self._require_agent_id()
         return self._request_json(
             "POST",
-            UPGRADE_REPORT_URL_TEMPLATE.format(agent_id=agent_id),
+            self._upgrade_report_url(agent_id),
             json_payload=payload,
             timeout=max(self.request_timeout, 120),
             with_auth=True,
         )
 
     def download_upgrade(self, version: str, dst: Path) -> Path:
+        self.refresh_base_config()
         response = self.session.get(
-            UPGRADE_DOWNLOAD_URL_TEMPLATE.format(version=version),
+            self._upgrade_download_url(version),
             timeout=max(self.request_timeout, 300),
         )
         response.raise_for_status()
@@ -236,8 +275,9 @@ class ServerClient:
         return dst
 
     def download_artifact(self, artifact_id: str, dst: Path) -> Path:
+        self.refresh_base_config()
         response = self.session.get(
-            ARTIFACT_URL_TEMPLATE.format(artifact_id=artifact_id),
+            self._artifact_url(artifact_id),
             timeout=max(self.request_timeout, 120),
         )
         response.raise_for_status()
@@ -271,6 +311,30 @@ class ServerClient:
         if not response.content:
             return {}
         return response.json()
+
+    def _register_url(self) -> str:
+        return f"{self.api_v1_base}/agents/register"
+
+    def _agent_config_url(self, agent_id: str) -> str:
+        return f"{self.api_v1_base}/agents/{agent_id}/config"
+
+    def _heartbeat_url(self, agent_id: str) -> str:
+        return f"{self.api_v1_base}/agents/{agent_id}/heartbeat"
+
+    def _event_batch_url(self) -> str:
+        return f"{self.api_v1_base}/events/batch"
+
+    def _scan_complete_url(self, agent_id: str) -> str:
+        return f"{self.api_v1_base}/agents/{agent_id}/scan-complete"
+
+    def _upgrade_report_url(self, agent_id: str) -> str:
+        return f"{self.api_v1_base}/agents/{agent_id}/upgrade-report"
+
+    def _upgrade_download_url(self, version: str) -> str:
+        return f"{self.api_v1_base}/upgrades/{version}/download"
+
+    def _artifact_url(self, artifact_id: str) -> str:
+        return f"{self.server_base}/api/artifacts/{artifact_id}"
 
     def _event_payload(self, item: Dict) -> Dict:
         agent_id = self._require_agent_id()
