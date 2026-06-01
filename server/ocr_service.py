@@ -353,19 +353,58 @@ def _normalize_box(box):
     return None
 
 
-def run_ocr(img_bytes: bytes, location: str) -> List[dict]:
+def _scale_box(box, scale: float):
+    if not box or not scale or abs(scale - 1.0) < 0.001:
+        return box
+    return [[round(float(x) / scale, 3), round(float(y) / scale, 3)] for x, y in box]
+
+
+def _resize_for_ocr(img, *, min_side: int = 900, max_side: int = 2600):
     import cv2
 
-    model = get_ocr_model()
-    img = _image_bytes_to_cv2(img_bytes)
-    if img is None:
-        return []
     height, width = img.shape[:2]
-    if width < 40 or height < 40:
-        return []
-    if width < 500 or height < 500:
-        img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    if width <= 0 or height <= 0:
+        return img, 1.0
+    scale = 1.0
+    shortest = min(width, height)
+    longest = max(width, height)
+    if shortest < min_side:
+        scale = max(scale, min_side / shortest)
+    if longest * scale > max_side:
+        scale = max_side / longest
+    if abs(scale - 1.0) < 0.001:
+        return img, 1.0
+    resized = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA)
+    return resized, scale
 
+
+def _ocr_candidate_images(img):
+    import cv2
+
+    base, base_scale = _resize_for_ocr(img)
+    candidates = [("base", base, base_scale)]
+
+    gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    candidates.append(("contrast", cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR), base_scale))
+
+    try:
+        denoised = cv2.fastNlMeansDenoising(clahe, None, 10, 7, 21)
+    except Exception:
+        denoised = clahe
+    binary = cv2.adaptiveThreshold(
+        denoised,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        9,
+    )
+    candidates.append(("binary", cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR), base_scale))
+    return candidates
+
+
+def _run_model_predict(model, img, location: str, scale: float) -> List[dict]:
     results = []
     for result in model.predict(img) or []:
         if isinstance(result, list):
@@ -376,7 +415,7 @@ def run_ocr(img_bytes: bytes, location: str) -> List[dict]:
                 rec_info = line[1]
                 text = str(rec_info[0]).strip() if isinstance(rec_info, (list, tuple)) and rec_info else ""
                 if text and bbox:
-                    results.append({"text": text, "bbox": bbox, "location": location})
+                    results.append({"text": text, "bbox": _scale_box(bbox, scale), "location": location})
         elif isinstance(result, dict):
             rec_texts = result.get("rec_texts") or []
             boxes = result.get("rec_boxes")
@@ -388,8 +427,42 @@ def run_ocr(img_bytes: bytes, location: str) -> List[dict]:
                 bbox = _normalize_box(box)
                 text = str(text).strip()
                 if text and bbox:
-                    results.append({"text": text, "bbox": bbox, "location": location})
+                    results.append({"text": text, "bbox": _scale_box(bbox, scale), "location": location})
     return results
+
+
+def _score_ocr_rows(rows: List[dict]) -> tuple[int, int]:
+    return (sum(len(str(item.get("text") or "")) for item in rows), len(rows))
+
+
+def run_ocr(img_bytes: bytes, location: str) -> List[dict]:
+    import cv2
+
+    model = get_ocr_model()
+    img = _image_bytes_to_cv2(img_bytes)
+    if img is None:
+        return []
+    height, width = img.shape[:2]
+    if width < 40 or height < 40:
+        return []
+
+    best_rows: List[dict] = []
+    best_variant = ""
+    for variant, candidate, scale in _ocr_candidate_images(img):
+        try:
+            rows = _run_model_predict(model, candidate, location, scale)
+        except Exception as exc:
+            logger.warning("ocr_variant_failed location=%s variant=%s error=%s", location, variant, exc)
+            continue
+        if _score_ocr_rows(rows) > _score_ocr_rows(best_rows):
+            best_rows = rows
+            best_variant = variant
+        if _score_ocr_rows(best_rows)[0] >= 24:
+            break
+    if best_rows:
+        OCR_STATE["last_success_at"] = time.time()
+        logger.info("ocr_completed location=%s variant=%s rows=%s chars=%s", location, best_variant, len(best_rows), _score_ocr_rows(best_rows)[0])
+    return best_rows
 
 
 app = FastAPI(title="SafeGuard OCR Service", version="1.0.0")

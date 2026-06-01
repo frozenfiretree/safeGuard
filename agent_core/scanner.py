@@ -217,6 +217,9 @@ class AgentScanner:
         snapshot = self._wait_for_stable_snapshot(path)
         if not snapshot:
             return False
+        return self.enqueue_upload_snapshot(snapshot)
+
+    def enqueue_upload_snapshot(self, snapshot: FileSnapshot) -> bool:
         payload = {
             "path": snapshot.path,
             "normalized_path": snapshot.normalized_path,
@@ -332,6 +335,19 @@ class AgentScanner:
                         stats["scanned"] += 1
                         baseline = self.store.get_baseline(snapshot.normalized_path)
                         if baseline and baseline.get("file_hash") == snapshot.sha256:
+                            if not int(baseline.get("uploaded") or 0):
+                                self.store.upsert_baseline(
+                                    file_path=snapshot.normalized_path,
+                                    file_hash=snapshot.sha256,
+                                    file_size=snapshot.size,
+                                    mtime=snapshot.mtime,
+                                    uploaded=0,
+                                )
+                                if self.enqueue_upload_snapshot(snapshot):
+                                    stats["uploaded"] += 1
+                                else:
+                                    stats["skipped"] += 1
+                                continue
                             self.store.upsert_baseline(
                                 file_path=snapshot.normalized_path,
                                 file_hash=snapshot.sha256,

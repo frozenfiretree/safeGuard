@@ -318,6 +318,43 @@ def normalize_path(value: str) -> str:
     return os.path.normcase(os.path.abspath(value))
 
 
+_WINDOWS_PATH_ENV_RE = re.compile(r"%[A-Za-z_][A-Za-z0-9_]*%")
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:([\\/]|$)")
+_WINDOWS_INVALID_COMPONENT_CHARS = set('<>:"|?*')
+
+
+def _looks_like_windows_path(value: str) -> bool:
+    raw = str(value or "").strip().strip('"').strip("'")
+    return bool(_WINDOWS_DRIVE_RE.match(raw) or raw.startswith("\\\\") or raw.startswith("//") or raw.startswith("%"))
+
+
+def is_valid_config_path(value: object) -> bool:
+    raw = str(value or "").strip().strip('"').strip("'")
+    if not raw or "\x00" in raw or any(ord(ch) < 32 for ch in raw):
+        return False
+    placeholder_safe = _WINDOWS_PATH_ENV_RE.sub("ENVVAR", raw)
+    if _looks_like_windows_path(raw):
+        if not (_WINDOWS_DRIVE_RE.match(placeholder_safe) or placeholder_safe.startswith("\\\\") or placeholder_safe.startswith("//") or placeholder_safe.startswith("ENVVAR")):
+            return False
+        tail = placeholder_safe[2:] if _WINDOWS_DRIVE_RE.match(placeholder_safe) else placeholder_safe
+        for part in re.split(r"[\\/]+", tail):
+            if not part or part in {".", ".."}:
+                continue
+            if any(ch in _WINDOWS_INVALID_COMPONENT_CHARS for ch in part):
+                return False
+        return True
+    return raw.startswith(("/", "~", "$"))
+
+
+def is_same_or_child_path(path: str, parent: str) -> bool:
+    try:
+        normalized_path = normalize_path(path)
+        normalized_parent = normalize_path(parent)
+        return os.path.commonpath([normalized_path, normalized_parent]) == normalized_parent
+    except Exception:
+        return False
+
+
 def _user_profile_is_system(profile: Path) -> bool:
     return "systemprofile" in str(profile).lower()
 
@@ -352,6 +389,8 @@ def _user_special_dirs(folder_name: str) -> List[str]:
 def expand_config_paths(value: object) -> List[str]:
     raw = str(value or "").strip().strip('"')
     if not raw:
+        return []
+    if not is_valid_config_path(raw):
         return []
     expanded = os.path.expanduser(os.path.expandvars(raw))
     raw_upper = raw.upper()
@@ -422,7 +461,7 @@ def is_temp_filename(name: str) -> bool:
 
 def should_exclude_path(path: str, exclude_paths: Iterable[str]) -> bool:
     normalized = normalize_path(path)
-    return any(normalized.startswith(normalize_path(item)) for item in exclude_paths if item)
+    return any(is_same_or_child_path(normalized, item) for item in exclude_paths if item)
 
 
 def build_agent_identity(existing_agent_id: str | None = None) -> dict:

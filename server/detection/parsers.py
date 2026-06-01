@@ -220,6 +220,7 @@ def _extract_pdf(path: Path) -> Dict:
     image_blocks = []
     pages_without_text = 0
     pages_with_text = 0
+    rendered_pages = 0
     page_count = len(doc)
 
     for page_idx, page in enumerate(doc, start=1):
@@ -232,6 +233,11 @@ def _extract_pdf(path: Path) -> Dict:
                     text_blocks.append(make_text_block(line, f"page:{page_idx}:line:{line_idx}", "pdf_text"))
         else:
             pages_without_text += 1
+            rendered = _render_pdf_page_for_ocr(page, scale=2.0)
+            if rendered:
+                rendered_pages += 1
+                image_blocks.append(make_image_block(rendered, f"page:{page_idx}:render", "pdf_page_render"))
+                continue
 
         for img_idx, img in enumerate(page.get_images(full=True), start=1):
             try:
@@ -263,10 +269,22 @@ def _extract_pdf(path: Path) -> Dict:
             "pages_with_text": pages_with_text,
             "pages_without_text": pages_without_text,
             "image_blocks": len(image_blocks),
+            "rendered_pages_for_ocr": rendered_pages,
         },
         "pages_without_text": pages_without_text,
         "parse_status": "ok",
     }
+
+
+def _render_pdf_page_for_ocr(page, scale: float = 2.0) -> Optional[bytes]:
+    try:
+        import fitz
+
+        matrix = fitz.Matrix(scale, scale)
+        pixmap = page.get_pixmap(matrix=matrix, alpha=False, annots=False)
+        return pixmap.tobytes("png")
+    except Exception:
+        return None
 
 
 def _convert_office_file(path: Path, target_extension: str, temp_prefix: str) -> Optional[Path]:

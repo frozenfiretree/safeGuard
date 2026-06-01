@@ -168,6 +168,10 @@ def build_final_decision(
     return {"source": "fusion", "is_sensitive": False, "confidence": 0.85 if risk_level == "LOW" else 0.6, "reason": "no_sensitive_findings"}
 
 
+def is_parse_failure(parse_result: Dict) -> bool:
+    return str(parse_result.get("parse_status") or "").lower() == "failed"
+
+
 def build_detection_result(
     agent_id: str,
     scan_id: str,
@@ -183,6 +187,8 @@ def build_detection_result(
     llm_findings = llm_result.get("llm_findings", [])
     needs_ocr = bool(parse_result.get("needs_ocr", False))
     ocr_error = ocr_result.get("ocr_error")
+    parse_failed = is_parse_failure(parse_result)
+    parse_error = str(parse_result.get("error") or parse_result.get("parse_error") or "")
     highlight_metadata = {
         "file_extension": (file_meta.get("extension") or "").lower(),
         "pdf_type": parse_result.get("pdf_type"),
@@ -198,6 +204,9 @@ def build_detection_result(
     }
     risk_level = calculate_risk_level(rule_findings, ocr_findings, llm_findings, needs_ocr, ocr_error)
     final_decision = build_final_decision(rule_findings, ocr_findings, llm_findings, risk_level, llm_result)
+    if parse_failed:
+        risk_level = "REVIEW"
+        final_decision = {"source": "parser", "is_sensitive": False, "confidence": 0.0, "reason": "parse_failed"}
     per_block_locations = []
     for block in parse_result.get("text_blocks", []):
         per_block_locations.append(
@@ -217,7 +226,9 @@ def build_detection_result(
             }
         )
 
-    if rule_findings or ocr_findings:
+    if parse_failed:
+        explanation_summary = f"File parsing failed: {parse_error or 'unknown parser error'}"
+    elif rule_findings or ocr_findings:
         explanation_summary = f"规则/OCR 共命中 {len(rule_findings) + len(ocr_findings)} 处，整体风险等级为 {risk_level}。"
     elif llm_findings:
         explanation_summary = llm_result.get("llm_summary") or f"LLM 语义复判发现 {len(llm_findings)} 处敏感内容，整体风险等级为 {risk_level}。"
@@ -237,6 +248,7 @@ def build_detection_result(
         "file_size": file_meta.get("size"),
         "file_extension": (file_meta.get("extension") or "").lower(),
         "parse_status": parse_result.get("parse_status"),
+        "parse_error": parse_error,
         "needs_ocr": needs_ocr,
         "ocr_available": ocr_error is None,
         "ocr_error": ocr_error,

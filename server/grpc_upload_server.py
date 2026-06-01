@@ -6,7 +6,14 @@ import grpc
 
 from config_app import GRPC_UPLOAD_HOST, GRPC_UPLOAD_PORT, setup_app_logger
 from grpc_proto import safeguard_upload_pb2, safeguard_upload_pb2_grpc
-from services import authenticate_agent, complete_upload_session, get_upload_status, init_upload_session, upload_chunk
+from services import (
+    authenticate_agent,
+    complete_upload_session,
+    get_upload_session_agent_id,
+    get_upload_status,
+    init_upload_session,
+    upload_chunk,
+)
 from tasks import submit_discovery_task
 
 
@@ -22,10 +29,46 @@ def _grpc_error(code: grpc.StatusCode, message: str):
     raise grpc.RpcError(f"{code.name}: {message}")
 
 
+def _metadata_value(context, key: str) -> str:
+    key = key.lower()
+    for item in context.invocation_metadata() or []:
+        if str(item.key).lower() == key:
+            return str(item.value or "").strip()
+    return ""
+
+
+def _metadata_bearer_token(context) -> str:
+    authorization = _metadata_value(context, "authorization")
+    if authorization.lower().startswith("bearer "):
+        return authorization.split(" ", 1)[1].strip()
+    return _metadata_value(context, "x-agent-token")
+
+
+def _require_upload_session_auth(context, session_id: str) -> None:
+    token = _metadata_bearer_token(context)
+    if not token:
+        context.abort(grpc.StatusCode.UNAUTHENTICATED, "agent authorization required")
+    try:
+        agent_id = get_upload_session_agent_id(session_id)
+    except ValueError as exc:
+        context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+
+    presented_agent_id = _metadata_value(context, "x-agent-id")
+    if presented_agent_id and presented_agent_id != agent_id:
+        context.abort(grpc.StatusCode.UNAUTHENTICATED, "agent authorization required")
+    try:
+        authenticate_agent(agent_id, token)
+    except ValueError:
+        context.abort(grpc.StatusCode.UNAUTHENTICATED, "agent authorization required")
+
+
 class UploadServiceServicer(safeguard_upload_pb2_grpc.UploadServiceServicer):
     def InitUpload(self, request, context):
         try:
-            authenticate_agent(request.agent_id, request.agent_token)
+            try:
+                authenticate_agent(request.agent_id, request.agent_token)
+            except ValueError:
+                context.abort(grpc.StatusCode.UNAUTHENTICATED, "agent authorization required")
             result = init_upload_session(
                 {
                     "file_hash": request.file_hash,
@@ -48,15 +91,23 @@ class UploadServiceServicer(safeguard_upload_pb2_grpc.UploadServiceServicer):
                 file_id=result.get("file_id", ""),
                 uploaded_chunks=[int(x) for x in (result.get("uploaded_chunks") or [])],
             )
+        except grpc.RpcError:
+            raise
         except Exception as exc:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
     def UploadChunks(self, request_iterator, context):
         session_id: Optional[str] = None
         uploaded_chunks = []
+        authorized_sessions = set()
         try:
             for request in request_iterator:
                 session_id = request.session_id or session_id
+                if not session_id:
+                    context.abort(grpc.StatusCode.INVALID_ARGUMENT, "session_id is required")
+                if session_id not in authorized_sessions:
+                    _require_upload_session_auth(context, session_id)
+                    authorized_sessions.add(session_id)
                 result = upload_chunk(
                     session_id=session_id or "",
                     index=int(request.index),
@@ -69,11 +120,14 @@ class UploadServiceServicer(safeguard_upload_pb2_grpc.UploadServiceServicer):
                 session_id=session_id or "",
                 uploaded_chunks=uploaded_chunks,
             )
+        except grpc.RpcError:
+            raise
         except Exception as exc:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 
     def GetUploadStatus(self, request, context):
         try:
+            _require_upload_session_auth(context, request.session_id)
             result = get_upload_status(request.session_id)
             return safeguard_upload_pb2.UploadStatusResponse(
                 session_id=result.get("session_id", ""),
@@ -81,11 +135,14 @@ class UploadServiceServicer(safeguard_upload_pb2_grpc.UploadServiceServicer):
                 uploaded_chunks=[int(x) for x in (result.get("uploaded_chunks") or [])],
                 total_chunks=int(result.get("total_chunks") or 0),
             )
+        except grpc.RpcError:
+            raise
         except Exception as exc:
             context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
 
     def CompleteUpload(self, request, context):
         try:
+            _require_upload_session_auth(context, request.session_id)
             result = complete_upload_session(request.session_id, request.priority or "MEDIUM")
             task_id = submit_discovery_task(result["file_hash"], priority=result.get("priority", request.priority or "MEDIUM"))
             return safeguard_upload_pb2.CompleteUploadResponse(
@@ -94,6 +151,8 @@ class UploadServiceServicer(safeguard_upload_pb2_grpc.UploadServiceServicer):
                 file_hash=result.get("file_hash", ""),
                 task_id=task_id or "",
             )
+        except grpc.RpcError:
+            raise
         except Exception as exc:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
 

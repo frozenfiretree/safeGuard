@@ -1,5 +1,6 @@
 import sys
 import unittest
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -150,6 +151,8 @@ Interface: 192.168.1.2 --- 0x7
 
 
 class AssetDiscoveryApiTests(unittest.TestCase):
+    ADMIN_HEADERS = {"Authorization": "Bearer test-admin-token"}
+
     def _client(self):
         try:
             from fastapi import FastAPI
@@ -173,16 +176,25 @@ class AssetDiscoveryApiTests(unittest.TestCase):
             "warnings": [],
             "errors": [],
         }
-        with mock.patch.object(api, "get_asset_network_context", return_value=payload):
-            response = client.get("/api/assets/context")
+        with mock.patch.dict(os.environ, {"SAFEGUARD_ADMIN_TOKEN": "test-admin-token"}), \
+            mock.patch.object(api, "get_asset_network_context", return_value=payload):
+            response = client.get("/api/assets/context", headers=self.ADMIN_HEADERS)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["platform"], "windows")
+
+    def test_assets_context_endpoint_requires_admin_token(self):
+        client, api = self._client()
+        with mock.patch.dict(os.environ, {"SAFEGUARD_ADMIN_TOKEN": "test-admin-token"}), \
+            mock.patch.object(api, "get_asset_network_context", return_value={}):
+            response = client.get("/api/assets/context")
+        self.assertEqual(response.status_code, 401)
 
     def test_assets_discover_endpoint_returns_assets_array(self):
         client, api = self._client()
         payload = {"status": "ok", "assets": [], "count": 0, "warnings": ["timeout"], "errors": []}
-        with mock.patch.object(api, "run_asset_discovery", return_value=payload):
-            response = client.post("/api/assets/discover", json={"timeout": 1})
+        with mock.patch.dict(os.environ, {"SAFEGUARD_ADMIN_TOKEN": "test-admin-token"}), \
+            mock.patch.object(api, "run_asset_discovery", return_value=payload):
+            response = client.post("/api/assets/discover", json={"timeout": 1}, headers=self.ADMIN_HEADERS)
         self.assertEqual(response.status_code, 200)
         self.assertIsInstance(response.json()["assets"], list)
         self.assertEqual(response.json()["warnings"], ["timeout"])

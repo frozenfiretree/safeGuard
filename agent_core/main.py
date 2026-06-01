@@ -53,6 +53,7 @@ class AgentRuntime:
         self.store = AgentStore()
         self.store.recover_if_needed()
         self.store.reset_in_progress_tasks()
+        self._revive_failed_upload_tasks("startup")
         self.client = ServerClient(self.store, self.logger)
         self._log_base_config()
         cached_config = self.store.get_json_state("config_json", {})
@@ -181,6 +182,7 @@ class AgentRuntime:
                 if self.store.get_current_state() == "OFFLINE":
                     self.set_state("RUNNING" if self.store.is_scan_completed() else "SCANNING")
                 failures = 0
+                self._revive_failed_upload_tasks("heartbeat")
                 self._handle_piggyback(result)
                 self._ensure_threads_alive()
             except Exception as exc:
@@ -205,6 +207,7 @@ class AgentRuntime:
                         self.scanner.start_monitoring()
                     if self.store.get_current_state() == "OFFLINE":
                         self.set_state("RUNNING")
+                    self._revive_failed_upload_tasks("config-sync")
             except Exception as exc:
                 self.logger.warning("config sync failed: %s", exc)
             self.stop_event.wait(self.runtime_config.config_pull_interval)
@@ -294,6 +297,7 @@ class AgentRuntime:
         while not self.stop_event.is_set():
             try:
                 self._handle_base_config_change()
+                self._revive_failed_upload_tasks("maintenance")
                 self.store.cleanup_tasks()
                 self._retry_pending_upgrade_report()
             except Exception as exc:
@@ -618,6 +622,11 @@ exit /b 0
             return True
         finally:
             self._server_switch_lock.release()
+
+    def _revive_failed_upload_tasks(self, source: str):
+        revived = self.store.revive_failed_upload_tasks()
+        if revived:
+            self.logger.info("revived failed upload tasks: source=%s count=%s", source, revived)
 
 
 class AgentWindowsService(win32serviceutil.ServiceFramework):

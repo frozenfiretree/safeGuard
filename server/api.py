@@ -68,6 +68,7 @@ from services import (
     update_global_config,
     upload_chunk,
     get_upload_status,
+    get_upload_session_agent_id,
     complete_upload_session,
 )
 from tasks import submit_discovery_task
@@ -127,6 +128,39 @@ def require_admin_auth(
     raise HTTPException(status_code=401, detail="admin authorization required")
 
 
+def require_agent_auth(agent_id: str, authorization: Optional[str], x_agent_token: Optional[str]):
+    token = _extract_token(authorization, x_agent_token)
+    try:
+        return authenticate_agent(agent_id, token)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="agent authorization required")
+
+
+def require_upload_session_auth(session_id: str, authorization: Optional[str], x_agent_token: Optional[str]):
+    if not _extract_token(authorization, x_agent_token):
+        raise HTTPException(status_code=401, detail="agent authorization required")
+    try:
+        agent_id = get_upload_session_agent_id(session_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return require_agent_auth(agent_id, authorization, x_agent_token)
+
+
+def require_admin_or_agent_auth(
+    authorization: Optional[str],
+    x_admin_token: Optional[str],
+    x_agent_id: Optional[str],
+    x_agent_token: Optional[str],
+):
+    try:
+        return require_admin_auth(authorization=authorization, x_admin_token=x_admin_token)
+    except HTTPException:
+        pass
+    if x_agent_id:
+        return require_agent_auth(x_agent_id, authorization, x_agent_token)
+    raise HTTPException(status_code=401, detail="authorization required")
+
+
 @router.get("/health")
 def health():
     return {"status": "ok", "version": APP_VERSION}
@@ -144,8 +178,7 @@ def get_config_endpoint(
     authorization: Optional[str] = Header(default=None),
     x_agent_token: Optional[str] = Header(default=None),
 ):
-    token = _extract_token(authorization, x_agent_token)
-    authenticate_agent(agent_id, token)
+    require_agent_auth(agent_id, authorization, x_agent_token)
     data = get_agent_config(agent_id, config_version)
     if data is None:
         return Response(status_code=304)
@@ -159,8 +192,7 @@ def heartbeat_endpoint(
     authorization: Optional[str] = Header(default=None),
     x_agent_token: Optional[str] = Header(default=None),
 ):
-    token = _extract_token(authorization, x_agent_token)
-    authenticate_agent(agent_id, token)
+    require_agent_auth(agent_id, authorization, x_agent_token)
     try:
         return heartbeat(agent_id, req.model_dump())
     except ValueError as e:
@@ -173,8 +205,7 @@ def upload_init_endpoint(
     authorization: Optional[str] = Header(default=None),
     x_agent_token: Optional[str] = Header(default=None),
 ):
-    token = _extract_token(authorization, x_agent_token)
-    authenticate_agent(req.agent_id, token)
+    require_agent_auth(req.agent_id, authorization, x_agent_token)
     return init_upload_session(req.model_dump())
 
 
@@ -184,7 +215,10 @@ async def upload_chunk_endpoint(
     index: int,
     request: Request,
     content_md5: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    x_agent_token: Optional[str] = Header(default=None),
 ):
+    require_upload_session_auth(session_id, authorization, x_agent_token)
     body = await request.body()
     try:
         return upload_chunk(session_id, index, body, content_md5)
@@ -193,7 +227,12 @@ async def upload_chunk_endpoint(
 
 
 @router.get("/uploads/{session_id}", response_model=UploadStatusResponse)
-def upload_status_endpoint(session_id: str):
+def upload_status_endpoint(
+    session_id: str,
+    authorization: Optional[str] = Header(default=None),
+    x_agent_token: Optional[str] = Header(default=None),
+):
+    require_upload_session_auth(session_id, authorization, x_agent_token)
     try:
         return get_upload_status(session_id)
     except ValueError as e:
@@ -201,7 +240,12 @@ def upload_status_endpoint(session_id: str):
 
 
 @router.post("/uploads/{session_id}/complete", response_model=UploadCompleteResponse, status_code=202)
-def upload_complete_endpoint(session_id: str):
+def upload_complete_endpoint(
+    session_id: str,
+    authorization: Optional[str] = Header(default=None),
+    x_agent_token: Optional[str] = Header(default=None),
+):
+    require_upload_session_auth(session_id, authorization, x_agent_token)
     try:
         data = complete_upload_session(session_id)
     except RuntimeError as e:
@@ -221,8 +265,7 @@ def events_batch_endpoint(
 ):
     if not req.events:
         return {"accepted": 0, "duplicates": 0}
-    token = _extract_token(authorization, x_agent_token)
-    authenticate_agent(req.events[0].agent_id, token)
+    require_agent_auth(req.events[0].agent_id, authorization, x_agent_token)
     return ingest_events_batch([item.model_dump() for item in req.events])
 
 
@@ -233,13 +276,20 @@ def scan_complete_endpoint(
     authorization: Optional[str] = Header(default=None),
     x_agent_token: Optional[str] = Header(default=None),
 ):
-    token = _extract_token(authorization, x_agent_token)
-    authenticate_agent(agent_id, token)
+    require_agent_auth(agent_id, authorization, x_agent_token)
     return mark_scan_complete(agent_id, req.model_dump())
 
 
 @router.get("/upgrades/{version}/download")
-def upgrade_download_endpoint(version: str, request: Request):
+def upgrade_download_endpoint(
+    version: str,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_admin_token: Optional[str] = Header(default=None),
+    x_agent_id: Optional[str] = Header(default=None),
+    x_agent_token: Optional[str] = Header(default=None),
+):
+    require_admin_or_agent_auth(authorization, x_admin_token, x_agent_id, x_agent_token)
     candidates = [
         UPGRADE_STORE_DIR / version / "SafeGuardAgent.exe",
         UPGRADE_STORE_DIR / version / "SensAgent.exe",
@@ -292,8 +342,7 @@ def upgrade_report_endpoint(
     authorization: Optional[str] = Header(default=None),
     x_agent_token: Optional[str] = Header(default=None),
 ):
-    token = _extract_token(authorization, x_agent_token)
-    authenticate_agent(agent_id, token)
+    require_agent_auth(agent_id, authorization, x_agent_token)
     return report_upgrade(agent_id, req.model_dump())
 
 
@@ -313,33 +362,33 @@ def admin_assets_refresh_endpoint(_=Depends(require_admin_auth)):
 
 
 @router.get("/assets")
-def assets_endpoint():
+def assets_endpoint(_=Depends(require_admin_auth)):
     return list_discovered_assets()
 
 
 @router.post("/assets/discover")
-def assets_discover_endpoint(req: AssetDiscoveryRequest):
+def assets_discover_endpoint(req: AssetDiscoveryRequest, _=Depends(require_admin_auth)):
     return run_asset_discovery(req.model_dump())
 
 
 @router.get("/assets/context")
-def assets_context_endpoint():
+def assets_context_endpoint(_=Depends(require_admin_auth)):
     return get_asset_network_context()
 
 
 @assets_alias_router.get("/assets")
-def assets_alias_endpoint():
-    return assets_endpoint()
+def assets_alias_endpoint(_=Depends(require_admin_auth)):
+    return list_discovered_assets()
 
 
 @assets_alias_router.post("/assets/discover")
-def assets_discover_alias_endpoint(req: AssetDiscoveryRequest):
-    return assets_discover_endpoint(req)
+def assets_discover_alias_endpoint(req: AssetDiscoveryRequest, _=Depends(require_admin_auth)):
+    return run_asset_discovery(req.model_dump())
 
 
 @assets_alias_router.get("/assets/context")
-def assets_context_alias_endpoint():
-    return assets_context_endpoint()
+def assets_context_alias_endpoint(_=Depends(require_admin_auth)):
+    return get_asset_network_context()
 
 
 @router.get("/admin/files")
@@ -401,7 +450,10 @@ def admin_task_failure_retry_endpoint(failure_id: int, _=Depends(require_admin_a
 
 @router.put("/admin/configs")
 def admin_update_configs_endpoint(req: AdminConfigUpdateRequest, _=Depends(require_admin_auth)):
-    return update_global_config(req.model_dump(exclude_unset=True))
+    try:
+        return update_global_config(req.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/admin/configs")
@@ -425,12 +477,12 @@ async def admin_upload_upgrade_endpoint(
 
 
 @router.get("/rules")
-def rules_list_endpoint(rule_type: Optional[str] = None, enabled: Optional[bool] = None, keyword: Optional[str] = None):
+def rules_list_endpoint(rule_type: Optional[str] = None, enabled: Optional[bool] = None, keyword: Optional[str] = None, _=Depends(require_admin_auth)):
     return {"items": list_detection_rules(rule_type=rule_type, enabled=enabled, keyword=keyword)}
 
 
 @router.get("/rules/{rule_id}")
-def rule_detail_endpoint(rule_id: str):
+def rule_detail_endpoint(rule_id: str, _=Depends(require_admin_auth)):
     try:
         return get_detection_rule(rule_id)
     except ValueError as e:
@@ -438,7 +490,7 @@ def rule_detail_endpoint(rule_id: str):
 
 
 @router.post("/rules")
-def rule_create_endpoint(req: DetectionRuleCreateRequest):
+def rule_create_endpoint(req: DetectionRuleCreateRequest, _=Depends(require_admin_auth)):
     try:
         return create_detection_rule(req.model_dump())
     except ValueError as e:
@@ -446,7 +498,7 @@ def rule_create_endpoint(req: DetectionRuleCreateRequest):
 
 
 @router.put("/rules/{rule_id}")
-def rule_update_endpoint(rule_id: str, req: DetectionRuleUpdateRequest):
+def rule_update_endpoint(rule_id: str, req: DetectionRuleUpdateRequest, _=Depends(require_admin_auth)):
     payload = req.model_dump(exclude_unset=True)
     try:
         return update_detection_rule(rule_id, payload)
@@ -457,7 +509,7 @@ def rule_update_endpoint(rule_id: str, req: DetectionRuleUpdateRequest):
 
 
 @router.delete("/rules/{rule_id}")
-def rule_delete_endpoint(rule_id: str):
+def rule_delete_endpoint(rule_id: str, _=Depends(require_admin_auth)):
     try:
         return delete_detection_rule(rule_id)
     except LookupError as e:
@@ -465,28 +517,43 @@ def rule_delete_endpoint(rule_id: str):
 
 
 @rules_alias_router.get("/rules")
-def rules_list_alias_endpoint(rule_type: Optional[str] = None, enabled: Optional[bool] = None, keyword: Optional[str] = None):
-    return rules_list_endpoint(rule_type=rule_type, enabled=enabled, keyword=keyword)
+def rules_list_alias_endpoint(rule_type: Optional[str] = None, enabled: Optional[bool] = None, keyword: Optional[str] = None, _=Depends(require_admin_auth)):
+    return {"items": list_detection_rules(rule_type=rule_type, enabled=enabled, keyword=keyword)}
 
 
 @rules_alias_router.get("/rules/{rule_id}")
-def rule_detail_alias_endpoint(rule_id: str):
-    return rule_detail_endpoint(rule_id)
+def rule_detail_alias_endpoint(rule_id: str, _=Depends(require_admin_auth)):
+    try:
+        return get_detection_rule(rule_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @rules_alias_router.post("/rules")
-def rule_create_alias_endpoint(req: DetectionRuleCreateRequest):
-    return rule_create_endpoint(req)
+def rule_create_alias_endpoint(req: DetectionRuleCreateRequest, _=Depends(require_admin_auth)):
+    try:
+        return create_detection_rule(req.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @rules_alias_router.put("/rules/{rule_id}")
-def rule_update_alias_endpoint(rule_id: str, req: DetectionRuleUpdateRequest):
-    return rule_update_endpoint(rule_id, req)
+def rule_update_alias_endpoint(rule_id: str, req: DetectionRuleUpdateRequest, _=Depends(require_admin_auth)):
+    payload = req.model_dump(exclude_unset=True)
+    try:
+        return update_detection_rule(rule_id, payload)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @rules_alias_router.delete("/rules/{rule_id}")
-def rule_delete_alias_endpoint(rule_id: str):
-    return rule_delete_endpoint(rule_id)
+def rule_delete_alias_endpoint(rule_id: str, _=Depends(require_admin_auth)):
+    try:
+        return delete_detection_rule(rule_id)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.get("/sensitive-files")
@@ -498,6 +565,7 @@ def sensitive_files_endpoint(
     file_type: Optional[str] = None,
     page: int = 1,
     page_size: int = 50,
+    _=Depends(require_admin_auth),
 ):
     return list_sensitive_files(
         agent_id=agent_id,
@@ -511,7 +579,7 @@ def sensitive_files_endpoint(
 
 
 @router.get("/sensitive-files/{tracked_file_id}/versions")
-def sensitive_file_versions_endpoint(tracked_file_id: str):
+def sensitive_file_versions_endpoint(tracked_file_id: str, _=Depends(require_admin_auth)):
     try:
         return get_sensitive_file_history(tracked_file_id)
     except ValueError as e:
@@ -519,7 +587,7 @@ def sensitive_file_versions_endpoint(tracked_file_id: str):
 
 
 @router.get("/sensitive-files/{tracked_file_id}/versions/{version_id}")
-def sensitive_file_version_detail_endpoint(tracked_file_id: str, version_id: str):
+def sensitive_file_version_detail_endpoint(tracked_file_id: str, version_id: str, _=Depends(require_admin_auth)):
     try:
         return get_sensitive_version_detail(tracked_file_id, version_id)
     except ValueError as e:
@@ -540,15 +608,15 @@ def _artifact_response(tracked_file_id: str, version_id: str, artifact: str):
 
 
 @router.get("/sensitive-files/{tracked_file_id}/versions/{version_id}/download")
-def sensitive_file_version_download_endpoint(tracked_file_id: str, version_id: str):
+def sensitive_file_version_download_endpoint(tracked_file_id: str, version_id: str, _=Depends(require_admin_auth)):
     return _artifact_response(tracked_file_id, version_id, "source")
 
 
 @router.get("/sensitive-files/{tracked_file_id}/versions/{version_id}/download-highlight")
-def sensitive_file_version_highlight_download_endpoint(tracked_file_id: str, version_id: str):
+def sensitive_file_version_highlight_download_endpoint(tracked_file_id: str, version_id: str, _=Depends(require_admin_auth)):
     return _artifact_response(tracked_file_id, version_id, "highlight")
 
 
 @router.get("/sensitive-files/{tracked_file_id}/versions/{version_id}/download-diff")
-def sensitive_file_version_diff_download_endpoint(tracked_file_id: str, version_id: str):
+def sensitive_file_version_diff_download_endpoint(tracked_file_id: str, version_id: str, _=Depends(require_admin_auth)):
     return _artifact_response(tracked_file_id, version_id, "diff")

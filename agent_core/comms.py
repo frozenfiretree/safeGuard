@@ -154,6 +154,7 @@ class ServerClient:
         token = self.store.get_state("token")
         if not token:
             raise RuntimeError("agent token missing")
+        grpc_metadata = (("authorization", f"Bearer {token}"), ("x-agent-id", agent_id))
         with grpc.insecure_channel(
             self.grpc_target,
             options=[
@@ -191,6 +192,7 @@ class ServerClient:
                 status_resp = stub.GetUploadStatus(
                     safeguard_upload_pb2.UploadStatusRequest(session_id=session_id),
                     timeout=max(self.request_timeout, 60),
+                    metadata=grpc_metadata,
                 )
                 uploaded_chunks = set(int(x) for x in (status_resp.uploaded_chunks or []))
 
@@ -212,7 +214,7 @@ class ServerClient:
                             chunk_sha256=hashlib.sha256(chunk).hexdigest(),
                         )
 
-            stub.UploadChunks(chunk_iter(), timeout=max(self.request_timeout, 300))
+            stub.UploadChunks(chunk_iter(), timeout=max(self.request_timeout, 300), metadata=grpc_metadata)
             if stop_event and stop_event.is_set():
                 raise RuntimeError("upload cancelled")
             complete_resp = stub.CompleteUpload(
@@ -221,6 +223,7 @@ class ServerClient:
                     priority=str(payload.get("priority") or "MEDIUM"),
                 ),
                 timeout=max(self.request_timeout, 300),
+                metadata=grpc_metadata,
             )
         return {
             "status": "ok",
@@ -264,10 +267,12 @@ class ServerClient:
 
     def download_upgrade(self, version: str, dst: Path) -> Path:
         self.refresh_base_config()
+        agent_id = self._require_agent_id()
         response = self.session.get(
             self._upgrade_download_url(version),
             timeout=max(self.request_timeout, 300),
             stream=True,
+            headers={**self._auth_headers(), "X-Agent-ID": agent_id},
         )
         response.raise_for_status()
         dst.parent.mkdir(parents=True, exist_ok=True)

@@ -165,7 +165,23 @@ class AgentStore:
                 """,
                 (task_id, task_type, json.dumps(payload, ensure_ascii=False), max_retries, now, now),
             )
-            return cur.rowcount > 0
+            if cur.rowcount > 0:
+                return True
+            row = conn.execute(
+                "SELECT status FROM task_queue WHERE task_id=? AND task_type=?",
+                (task_id, task_type),
+            ).fetchone()
+            if row and str(row["status"] or "") == "FAILED":
+                conn.execute(
+                    """
+                    UPDATE task_queue
+                    SET status='PENDING', payload=?, retry_count=0, max_retries=?, last_error=NULL, updated_at=?
+                    WHERE task_id=? AND task_type='UPLOAD' AND status='FAILED'
+                    """,
+                    (json.dumps(payload, ensure_ascii=False), max_retries, now, task_id),
+                )
+                return True
+            return False
 
     def fetch_pending_tasks(self, limit: int, task_type: Optional[str] = None) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM task_queue WHERE status='PENDING'"
@@ -196,10 +212,7 @@ class AgentStore:
 
     def retry_task(self, task_id: str, error: str):
         with self._lock, self._connect() as conn:
-            row = conn.execute(
-                "SELECT retry_count, max_retries FROM task_queue WHERE task_id=?",
-                (task_id,),
-            ).fetchone()
+            row = conn.execute("SELECT retry_count, max_retries FROM task_queue WHERE task_id=?", (task_id,)).fetchone()
             if not row:
                 return
             retry_count = int(row["retry_count"] or 0) + 1
@@ -243,6 +256,29 @@ class AgentStore:
                 "UPDATE task_queue SET status='PENDING', updated_at=? WHERE status='IN_PROGRESS'",
                 (now_iso(),),
             )
+
+    def revive_failed_upload_tasks(self) -> int:
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE task_queue
+                SET status='PENDING', retry_count=0, updated_at=?
+                WHERE task_type='UPLOAD' AND status='FAILED'
+                """,
+                (now_iso(),),
+            )
+            return int(cur.rowcount or 0)
+
+    def retryable_upload_backlog_count(self) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(1) AS c
+                FROM task_queue
+                WHERE task_type='UPLOAD' AND status IN ('PENDING', 'IN_PROGRESS', 'FAILED')
+                """
+            ).fetchone()
+            return int(row["c"] or 0)
 
     def clear_runtime_state_for_server_switch(self):
         with self._lock, self._connect() as conn:

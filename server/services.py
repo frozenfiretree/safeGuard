@@ -57,6 +57,52 @@ def _now() -> float:
     return time.time()
 
 
+def _is_parse_failure_result(result: dict) -> bool:
+    return str(result.get("parse_status") or "").lower() == "failed"
+
+
+def _parse_failure_message(result: dict) -> str:
+    return str(result.get("parse_error") or result.get("error") or result.get("explanation_summary") or "File parsing failed")
+
+
+def _persist_parse_failure_result(file_hash: str, result: dict) -> str:
+    message = _parse_failure_message(result)
+    with db_session() as session:
+        file_row = session.get(FileRecord, file_hash)
+        if not file_row:
+            raise ValueError("file missing after detection")
+
+        parse_row = session.get(ParseResult, file_hash)
+        parse_status = str(result.get("parse_status") or "failed")
+        if not parse_row:
+            parse_row = ParseResult(file_hash=file_hash, parse_status=parse_status, result_data=result)
+            session.add(parse_row)
+        else:
+            parse_row.parse_status = parse_status
+            parse_row.result_data = result
+            parse_row.updated_at = _now()
+
+        session.query(RuleHit).filter(RuleHit.file_hash == file_hash).delete()
+        file_row.detection_status = FileDetectionStatus.PARSE_FAILED.value
+        file_row.is_sensitive = False
+        file_row.risk_level = result.get("risk_level") or "REVIEW"
+        file_row.explanation_summary = message
+        file_row.updated_at = _now()
+
+    record_task_failure(
+        "tasks.discovery_task",
+        {
+            "file_hash": file_hash,
+            "stage": "parse",
+            "parse_status": str(result.get("parse_status") or "failed"),
+            "file_name": result.get("file_name"),
+        },
+        message,
+    )
+    logger.warning("discovery parse failed: file_hash=%s error=%s", file_hash, message)
+    return message
+
+
 def check_ocr_service_health() -> dict:
     started = time.time()
     base = {
@@ -125,6 +171,76 @@ def _has_legacy_broad_watch(value: object) -> bool:
     return text in {"c:\\users", "\\home"} or "devicesearchcache" in text or "\\appdata\\" in text
 
 
+_WINDOWS_PATH_ENV_RE = re.compile(r"%[A-Za-z_][A-Za-z0-9_]*%")
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:([\\/]|$)")
+_WINDOWS_INVALID_COMPONENT_CHARS = set('<>:"|?*')
+
+
+def _looks_like_windows_path(value: str) -> bool:
+    raw = str(value or "").strip().strip('"').strip("'")
+    return bool(_WINDOWS_DRIVE_RE.match(raw) or raw.startswith("\\\\") or raw.startswith("//") or raw.startswith("%"))
+
+
+def _validate_config_path(path_value: object, field_name: str) -> str:
+    raw = str(path_value or "").strip().strip('"').strip("'")
+    if not raw:
+        raise ValueError(f"{field_name} contains empty path")
+    if any(ord(ch) < 32 for ch in raw):
+        raise ValueError(f"{field_name} contains control characters: {raw!r}")
+    if "\x00" in raw:
+        raise ValueError(f"{field_name} contains null byte")
+
+    placeholder_safe = _WINDOWS_PATH_ENV_RE.sub("ENVVAR", raw)
+    if _looks_like_windows_path(raw):
+        if not (_WINDOWS_DRIVE_RE.match(placeholder_safe) or placeholder_safe.startswith("\\\\") or placeholder_safe.startswith("//") or placeholder_safe.startswith("ENVVAR")):
+            raise ValueError(f"{field_name} must be an absolute Windows path: {raw}")
+        tail = placeholder_safe[2:] if _WINDOWS_DRIVE_RE.match(placeholder_safe) else placeholder_safe
+        for part in re.split(r"[\\/]+", tail):
+            if not part or part in {".", ".."}:
+                continue
+            if any(ch in _WINDOWS_INVALID_COMPONENT_CHARS for ch in part):
+                raise ValueError(f"{field_name} contains invalid Windows path characters: {raw}")
+    else:
+        if not raw.startswith(("/", "~", "$")):
+            raise ValueError(f"{field_name} must be an absolute path: {raw}")
+        if any(ch in raw for ch in "\x00"):
+            raise ValueError(f"{field_name} contains invalid path characters: {raw}")
+    return raw
+
+
+def _clean_config_path_list(values: object, field_name: str) -> List[str]:
+    cleaned: List[str] = []
+    seen = set()
+    for item in values or []:
+        path = _validate_config_path(item, field_name)
+        key = path.replace("/", "\\").rstrip("\\").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(path)
+    return cleaned
+
+
+def _validate_include_extensions(values: object) -> List[str]:
+    cleaned: List[str] = []
+    seen = set()
+    for item in values or []:
+        ext = str(item or "").strip().lower()
+        if not ext:
+            continue
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        if not re.fullmatch(r"\.[a-z0-9]{1,16}", ext):
+            raise ValueError(f"include_extensions contains invalid extension: {item}")
+        if ext in seen:
+            continue
+        seen.add(ext)
+        cleaned.append(ext)
+    if not cleaned:
+        raise ValueError("include_extensions cannot be empty")
+    return cleaned
+
+
 def _default_config_payload(version: int, watch_dirs: Optional[List[str]] = None) -> dict:
     scan_dirs = _restricted_agent_dirs()
     exclude_paths = [
@@ -163,8 +279,14 @@ def _sanitize_agent_config_payload(payload: Optional[dict], version: int) -> tup
     if not watch_dirs or any(_has_legacy_broad_watch(item) for item in watch_dirs):
         current["watch_dirs"] = _restricted_agent_dirs()
         changed = True
+    for field_name in ("scan_dirs", "watch_dirs", "exclude_paths"):
+        if field_name in current:
+            cleaned = _clean_config_path_list(current.get(field_name) or [], field_name)
+            if cleaned != current.get(field_name):
+                current[field_name] = cleaned
+                changed = True
     current.setdefault("include_extensions", [".doc", ".docx", ".xlsx", ".pdf", ".ppt", ".pptx", ".csv", ".txt", ".png", ".jpg", ".jpeg", ".bmp"])
-    include_extensions = [str(item).lower() for item in current.get("include_extensions") or []]
+    include_extensions = _validate_include_extensions(current.get("include_extensions") or [])
     if ".doc" not in include_extensions:
         include_extensions.append(".doc")
         current["include_extensions"] = include_extensions
@@ -173,7 +295,12 @@ def _sanitize_agent_config_payload(payload: Optional[dict], version: int) -> tup
         include_extensions.append(".ppt")
         current["include_extensions"] = include_extensions
         changed = True
+    if include_extensions != current.get("include_extensions"):
+        current["include_extensions"] = include_extensions
+        changed = True
     current.setdefault("exclude_paths", _default_config_payload(version).get("exclude_paths", []))
+    current["max_file_size_mb"] = max(1, min(1024, int(current.get("max_file_size_mb") or 100)))
+    current["heartbeat_interval_sec"] = max(5, min(3600, int(current.get("heartbeat_interval_sec") or 60)))
     if int(current.get("config_version") or 0) != int(version):
         current["config_version"] = version
         changed = True
@@ -577,6 +704,14 @@ def get_upload_status(session_id: str) -> dict:
         }
 
 
+def get_upload_session_agent_id(session_id: str) -> str:
+    with db_session() as session:
+        row = session.get(UploadSession, session_id)
+        if not row:
+            raise ValueError("upload session not found")
+        return row.agent_id
+
+
 def complete_upload_session(session_id: str, priority: str = "MEDIUM") -> dict:
     cleanup_chunks = 0
     temp_path = None
@@ -735,6 +870,11 @@ def run_discovery_pipeline(file_hash: str) -> dict:
         except Exception:
             pass
 
+    if _is_parse_failure_result(result):
+        message = _persist_parse_failure_result(file_hash, result)
+        refresh_watch_dirs()
+        return {"status": "parse_failed", "file_hash": file_hash, "risk_level": result.get("risk_level") or "REVIEW", "error": message}
+
     with db_session() as session:
         file_row = session.get(FileRecord, file_hash)
         if not file_row:
@@ -796,6 +936,7 @@ def get_detection_result_payload(file_hash: str) -> Optional[dict]:
             "file_type": file_row.file_type,
             "file_size": file_row.file_size,
             "parse_status": parse_row.parse_status,
+            "parse_error": (parse_row.result_data or {}).get("parse_error") or (parse_row.result_data or {}).get("error") or "",
             "needs_ocr": bool((parse_row.result_data or {}).get("needs_ocr")),
             "ocr_available": bool((parse_row.result_data or {}).get("ocr_available", True)),
             "ocr_error": (parse_row.result_data or {}).get("ocr_error"),
@@ -1318,11 +1459,12 @@ def update_global_config(payload: dict) -> dict:
             merged[key] = value
         config.version = int(config.version) + 1
         merged["config_version"] = config.version
-        config.config_data = merged
+        sanitized, _ = _sanitize_agent_config_payload(merged, config.version)
+        config.config_data = sanitized
         config.updated_at = _now()
         session.add(config)
         session.flush()
-        return {"config_version": config.version, "config": merged}
+        return {"config_version": config.version, "config": sanitized}
 
 
 def _read_json(path: Path, default=None):
