@@ -19,6 +19,7 @@ from .config import (
     AGENT_VERSION,
     DEFAULT_SERVER_BASE,
     INSTALL_CONFIG_PATH,
+    LOG_DIR,
     PROGRAM_DATA_DIR,
     SERVER_BASE,
     SERVICE_DESCRIPTION,
@@ -39,6 +40,10 @@ from .store import AgentStore
 ERROR_ALREADY_EXISTS = 183
 RUNTIME_MUTEX_NAME = "Global\\SafeGuardAgentRuntime"
 INSTALLER_MUTEX_NAME = "Global\\SafeGuardAgentInstaller"
+SERVICE_ALREADY_RUNNING_ERROR = 1056
+SERVICE_START_TIMEOUT_ERROR = 1053
+UPGRADE_FAILURE_COOLDOWN_SECONDS = 3600
+MIN_UPGRADE_EXE_SIZE_BYTES = 1024 * 1024
 
 
 class AgentRuntime:
@@ -290,6 +295,7 @@ class AgentRuntime:
             try:
                 self._handle_base_config_change()
                 self.store.cleanup_tasks()
+                self._retry_pending_upgrade_report()
             except Exception as exc:
                 self.logger.warning("maintenance failed: %s", exc)
             self.stop_event.wait(600)
@@ -299,6 +305,35 @@ class AgentRuntime:
         checksum = str(upgrade.get("checksum") or "").strip().lower()
         if not version:
             return
+        upgrade_key = f"{version}:{checksum or 'no-checksum'}"
+        if self._consume_upgrade_rollback_marker(version, checksum, upgrade_key):
+            return
+        current_exe_checksum = ""
+        if getattr(sys, "frozen", False):
+            try:
+                current_exe_checksum = self._sha256_of_path(Path(sys.executable))
+            except Exception:
+                current_exe_checksum = ""
+        if version == AGENT_VERSION and (not checksum or checksum == current_exe_checksum):
+            if self.store.get_state("last_successful_upgrade_key", "") != upgrade_key:
+                self._report_upgrade_result(
+                    {
+                        "old_version": AGENT_VERSION,
+                        "new_version": version,
+                        "success": True,
+                        "error_message": "agent is already running the requested version",
+                    }
+                )
+                self.store.set_state("last_successful_upgrade_key", upgrade_key)
+            return
+        failed_key = self.store.get_state("last_failed_upgrade_key", "")
+        try:
+            failed_at = float(self.store.get_state("last_failed_upgrade_at", "0") or 0)
+        except Exception:
+            failed_at = 0
+        if failed_key == upgrade_key and time.time() - failed_at < UPGRADE_FAILURE_COOLDOWN_SECONDS:
+            self.logger.warning("skip repeated upgrade attempt during cooldown: version=%s checksum=%s", version, checksum)
+            return
         if not self._upgrade_lock.acquire(blocking=False):
             return
         restart_scheduled = False
@@ -306,11 +341,32 @@ class AgentRuntime:
             self.set_state("UPGRADING")
             updates_dir = PROGRAM_DATA_DIR / "updates" / version
             target = updates_dir / "SafeGuardAgent.exe"
+            self.store.set_json_state(
+                "last_upgrade_attempt",
+                {
+                    "version": version,
+                    "checksum": checksum,
+                    "target": str(target),
+                    "started_at": time.time(),
+                    "status": "downloading",
+                },
+            )
             self.client.download_upgrade(version, target)
+            self._validate_upgrade_exe(target)
             if checksum and self._sha256_of_path(target) != checksum:
                 raise RuntimeError("upgrade checksum mismatch")
-            restart_scheduled = self._apply_service_upgrade(target)
-            self.client.report_upgrade_result(
+            self.store.set_json_state(
+                "last_upgrade_attempt",
+                {
+                    "version": version,
+                    "checksum": checksum,
+                    "target": str(target),
+                    "started_at": time.time(),
+                    "status": "applying",
+                },
+            )
+            restart_scheduled = self._apply_service_upgrade(target, version, checksum)
+            self._report_upgrade_result(
                 {
                     "old_version": AGENT_VERSION,
                     "new_version": version,
@@ -318,24 +374,109 @@ class AgentRuntime:
                     "error_message": None if restart_scheduled else "package downloaded; service restart skipped in non-service mode",
                 }
             )
+            self.store.set_state("last_successful_upgrade_key", upgrade_key)
+            self.store.set_json_state(
+                "last_upgrade_attempt",
+                {
+                    "version": version,
+                    "checksum": checksum,
+                    "target": str(target),
+                    "completed_at": time.time(),
+                    "status": "restart_scheduled" if restart_scheduled else "downloaded_only",
+                },
+            )
             self.logger.info("upgrade package downloaded: version=%s, path=%s", version, target)
         except Exception as exc:
             self.logger.warning("upgrade handling failed: %s", exc)
-            try:
-                self.client.report_upgrade_result(
-                    {
-                        "old_version": AGENT_VERSION,
-                        "new_version": version,
-                        "success": False,
-                        "error_message": str(exc),
-                    }
-                )
-            except Exception:
-                pass
+            self.store.set_state("last_failed_upgrade_key", upgrade_key)
+            self.store.set_state("last_failed_upgrade_at", str(time.time()))
+            self.store.set_json_state(
+                "last_upgrade_attempt",
+                {
+                    "version": version,
+                    "checksum": checksum,
+                    "failed_at": time.time(),
+                    "status": "failed",
+                    "error": str(exc),
+                },
+            )
+            self._report_upgrade_result(
+                {
+                    "old_version": AGENT_VERSION,
+                    "new_version": version,
+                    "success": False,
+                    "error_message": str(exc),
+                }
+            )
         finally:
             if not self.stop_event.is_set() and not restart_scheduled:
                 self.set_state("RUNNING" if self.store.is_scan_completed() else "SCANNING")
             self._upgrade_lock.release()
+
+    def _consume_upgrade_rollback_marker(self, version: str, checksum: str, upgrade_key: str) -> bool:
+        marker = PROGRAM_DATA_DIR / "updates" / version / "upgrade_failed.json"
+        if not marker.exists():
+            return False
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        marker_checksum = str(data.get("checksum") or "").strip().lower()
+        if marker_checksum and marker_checksum != checksum:
+            return False
+        error_message = str(data.get("error") or "new agent executable failed to start; rolled back to previous executable")
+        self.logger.warning("upgrade rollback marker found: version=%s checksum=%s error=%s", version, checksum, error_message)
+        self.store.set_state("last_failed_upgrade_key", upgrade_key)
+        self.store.set_state("last_failed_upgrade_at", str(time.time()))
+        self.store.set_json_state(
+            "last_upgrade_attempt",
+            {
+                "version": version,
+                "checksum": checksum,
+                "failed_at": time.time(),
+                "status": "rolled_back",
+                "error": error_message,
+            },
+        )
+        self._report_upgrade_result(
+            {
+                "old_version": AGENT_VERSION,
+                "new_version": version,
+                "success": False,
+                "error_message": error_message,
+            }
+        )
+        try:
+            marker.unlink()
+        except Exception:
+            pass
+        return True
+
+    def _report_upgrade_result(self, payload: dict):
+        self.store.set_json_state("last_upgrade_report_payload", payload)
+        try:
+            result = self.client.report_upgrade_result(payload)
+            self.store.set_json_state("last_upgrade_report_result", result)
+            self.store.set_state("last_upgrade_report_at", str(time.time()))
+            self.store.set_json_state("last_upgrade_report_error", None)
+            return result
+        except Exception as exc:
+            self.logger.warning("upgrade report failed: %s", exc)
+            self.store.set_json_state("last_upgrade_report_error", {"error": str(exc), "at": time.time()})
+            return None
+
+    def _retry_pending_upgrade_report(self):
+        error = self.store.get_json_state("last_upgrade_report_error", None)
+        payload = self.store.get_json_state("last_upgrade_report_payload", None)
+        if not error or not isinstance(payload, dict):
+            return
+        try:
+            result = self.client.report_upgrade_result(payload)
+            self.store.set_json_state("last_upgrade_report_result", result)
+            self.store.set_state("last_upgrade_report_at", str(time.time()))
+            self.store.set_json_state("last_upgrade_report_error", None)
+        except Exception as exc:
+            self.logger.warning("pending upgrade report retry failed: %s", exc)
 
     def _sha256_of_path(self, path: Path) -> str:
         digest = hashlib.sha256()
@@ -344,9 +485,23 @@ class AgentRuntime:
                 digest.update(chunk)
         return digest.hexdigest().lower()
 
-    def _apply_service_upgrade(self, target: Path) -> bool:
+    def _validate_upgrade_exe(self, target: Path):
+        if not target.exists() or not target.is_file():
+            raise RuntimeError(f"upgrade package not found after download: {target}")
+        size = target.stat().st_size
+        if size < MIN_UPGRADE_EXE_SIZE_BYTES:
+            raise RuntimeError(f"upgrade package is too small to be a valid agent executable: {size} bytes")
+        with open(target, "rb") as handle:
+            if handle.read(2) != b"MZ":
+                raise RuntimeError("upgrade package is not a Windows executable")
+
+    def _apply_service_upgrade(self, target: Path, version: str, checksum: str) -> bool:
         if not getattr(sys, "frozen", False):
             self.logger.info("skip service binary switch in non-frozen mode")
+            return False
+        current_exe = Path(sys.executable).resolve()
+        if current_exe == target.resolve():
+            self.logger.info("upgrade target is current executable; no service switch needed")
             return False
 
         scm = None
@@ -354,20 +509,8 @@ class AgentRuntime:
         try:
             scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
             service = win32service.OpenService(scm, SERVICE_NAME, win32service.SERVICE_ALL_ACCESS)
-            win32service.ChangeServiceConfig(
-                service,
-                win32service.SERVICE_NO_CHANGE,
-                win32service.SERVICE_NO_CHANGE,
-                win32service.SERVICE_NO_CHANGE,
-                f'"{target}"',
-                None,
-                0,
-                None,
-                None,
-                None,
-                SERVICE_DISPLAY_NAME,
-            )
-            self._schedule_service_restart()
+            script = self._write_upgrade_restart_script(current_exe, target, version, checksum)
+            self._schedule_service_restart(script)
             return True
         finally:
             if service:
@@ -375,14 +518,53 @@ class AgentRuntime:
             if scm:
                 win32service.CloseServiceHandle(scm)
 
-    def _schedule_service_restart(self):
-        cmd = (
-            f'sc stop "{SERVICE_NAME}" >nul 2>nul & '
-            f'ping 127.0.0.1 -n 6 >nul & '
-            f'sc start "{SERVICE_NAME}" >nul 2>nul'
-        )
+    def _write_upgrade_restart_script(self, previous_exe: Path, target: Path, version: str, checksum: str) -> Path:
+        script_dir = PROGRAM_DATA_DIR / "updates" / version
+        script_dir.mkdir(parents=True, exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        script_path = script_dir / "apply_upgrade.cmd"
+        log_path = LOG_DIR / "agent_upgrade.log"
+        marker_path = script_dir / "upgrade_failed.json"
+        content = f"""@echo off
+setlocal EnableExtensions
+set "SERVICE={SERVICE_NAME}"
+set "NEW_EXE={target}"
+set "OLD_EXE={previous_exe}"
+set "LOG={log_path}"
+set "MARKER={marker_path}"
+echo [%date% %time%] applying SafeGuard Agent upgrade version={version} checksum={checksum} >> "%LOG%"
+if exist "%MARKER%" del /f /q "%MARKER%" >nul 2>nul
+sc stop "%SERVICE%" >> "%LOG%" 2>>&1
+for /l %%i in (1,1,45) do (
+  sc query "%SERVICE%" | findstr /I "STOPPED" >nul 2>nul
+  if not errorlevel 1 goto stopped
+  ping 127.0.0.1 -n 2 >nul
+)
+:stopped
+sc config "%SERVICE%" binPath= "\"%NEW_EXE%\" --service" >> "%LOG%" 2>>&1
+sc start "%SERVICE%" >> "%LOG%" 2>>&1
+for /l %%i in (1,1,45) do (
+  sc query "%SERVICE%" | findstr /I "RUNNING" >nul 2>nul
+  if not errorlevel 1 goto success
+  ping 127.0.0.1 -n 2 >nul
+)
+echo [%date% %time%] new service failed to reach RUNNING; rolling back >> "%LOG%"
+echo {{"version":"{version}","checksum":"{checksum}","failed_at":"%date% %time%","error":"new agent executable failed to reach RUNNING; rolled back to previous executable"}} > "%MARKER%"
+sc stop "%SERVICE%" >> "%LOG%" 2>>&1
+ping 127.0.0.1 -n 4 >nul
+sc config "%SERVICE%" binPath= "\"%OLD_EXE%\" --service" >> "%LOG%" 2>>&1
+sc start "%SERVICE%" >> "%LOG%" 2>>&1
+exit /b 1
+:success
+echo [%date% %time%] upgrade service start succeeded >> "%LOG%"
+exit /b 0
+"""
+        script_path.write_text(content, encoding="utf-8")
+        return script_path
+
+    def _schedule_service_restart(self, script: Path):
         subprocess.Popen(
-            ["cmd", "/c", cmd],
+            ["cmd", "/c", str(script)],
             creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
             close_fds=True,
         )
@@ -502,6 +684,14 @@ def _is_admin() -> bool:
         return False
 
 
+def _is_runtime_already_running() -> bool:
+    guard = _SingleInstanceGuard(RUNTIME_MUTEX_NAME)
+    if not guard.acquire():
+        return True
+    guard.release()
+    return False
+
+
 def _service_exe_path() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve()
@@ -573,6 +763,68 @@ def _read_service_state() -> str:
     if "STOP_PENDING" in text:
         return "STOP_PENDING"
     return "UNKNOWN"
+
+
+def _requested_grpc_target(server_base: str) -> str:
+    return str(_value_after_flag("--grpc-upload-target") or default_grpc_target(server_base))
+
+
+def _requested_work_dir() -> str:
+    return str(_value_after_flag("--work-dir") or WORK_DIR)
+
+
+def _install_request_changes_existing_config(server_base: str, grpc_upload_target: str) -> bool:
+    existing_settings = _read_install_settings()
+    previous_server_base = str(existing_settings.get("server_base") or "").rstrip("/")
+    previous_grpc_target = str(existing_settings.get("grpc_upload_target") or "").strip()
+    if not previous_server_base:
+        return False
+    return previous_server_base != server_base.rstrip("/") or (
+        bool(previous_grpc_target) and previous_grpc_target != str(grpc_upload_target).strip()
+    )
+
+
+def _safe_start_service() -> bool:
+    state = _read_service_state()
+    if state == "RUNNING":
+        return True
+    try:
+        win32serviceutil.StartService(SERVICE_NAME)
+        return True
+    except Exception as exc:
+        winerror = getattr(exc, "winerror", None)
+        if winerror == SERVICE_ALREADY_RUNNING_ERROR:
+            return True
+        if winerror == SERVICE_START_TIMEOUT_ERROR:
+            try:
+                logger = setup_logging()
+                logger.warning("service start timed out; current_state=%s error=%s", _read_service_state(), exc)
+            except Exception:
+                pass
+            return False
+        raise
+
+
+def _show_already_running_message(server_base: str, work_dir: str, grpc_upload_target: str, server_changed: bool = False):
+    if server_changed:
+        message = (
+            "SafeGuard Agent is already running.\n\n"
+            "The requested server address is different from the installed configuration. "
+            "Run this installer as administrator to switch servers and restart the service.\n\n"
+            f"Requested server: {server_base}\n"
+            f"Work directory: {work_dir}\n"
+            f"gRPC upload target: {grpc_upload_target}"
+        )
+    else:
+        message = (
+            "SafeGuard Agent is already running.\n\n"
+            "No second Agent process was started.\n\n"
+            f"Server: {server_base}\n"
+            f"Work directory: {work_dir}\n"
+            f"gRPC upload target: {grpc_upload_target}\n"
+            f"Service state: {_read_service_state()}"
+        )
+    _message_box("SafeGuard Agent", message)
 
 
 def _format_time_text(raw_value) -> str:
@@ -741,8 +993,8 @@ def _install_service(server_base: str | None = None, work_dir: str | None = None
     if service_exists and not server_changed:
         _write_install_settings(server_base, work_dir, grpc_upload_target)
         _configure_existing_service(exe_path)
-        if auto_start and _read_service_state() != "RUNNING":
-            win32serviceutil.StartService(SERVICE_NAME)
+        if auto_start:
+            _safe_start_service()
         return
 
     if service_exists:
@@ -770,7 +1022,7 @@ def _install_service(server_base: str | None = None, work_dir: str | None = None
     )
     _configure_existing_service(exe_path)
     if auto_start:
-        win32serviceutil.StartService(SERVICE_NAME)
+        _safe_start_service()
 
 
 def _remove_service():
@@ -782,15 +1034,22 @@ def _remove_service():
 
 def _restart_service():
     _stop_service_if_exists()
-    win32serviceutil.StartService(SERVICE_NAME)
+    _safe_start_service()
 
 
-def _elevate_for_install(server_base: str, work_dir: str, grpc_upload_target: str):
+def _elevate_for_install(server_base: str, work_dir: str, grpc_upload_target: str) -> bool:
     exe_path = str(_service_exe_path())
     params = f'--self-install --server-base "{server_base}" --work-dir "{work_dir}" --grpc-upload-target "{grpc_upload_target}"'
     result = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe_path, params, None, 1)
     if int(result) <= 32:
-        raise RuntimeError(f"failed to elevate installer, code={int(result)}")
+        _message_box(
+            "SafeGuard Agent",
+            "SafeGuard Agent needs administrator permission to install or update the Windows service.\n\n"
+            f"Elevation failed or was cancelled. Code: {int(result)}",
+            0x30,
+        )
+        return False
+    return True
 
 
 def _value_after_flag(flag: str) -> str | None:
@@ -815,9 +1074,16 @@ def _self_install():
         _message_box("SafeGuard Agent", "已有另一个 SafeGuard 安装程序正在运行。")
         return
     server_base = _requested_server_base()
-    work_dir = str(_value_after_flag("--work-dir") or WORK_DIR)
-    grpc_upload_target = str(_value_after_flag("--grpc-upload-target") or default_grpc_target(server_base))
+    work_dir = _requested_work_dir()
+    grpc_upload_target = _requested_grpc_target(server_base)
+    server_changed = _install_request_changes_existing_config(server_base, grpc_upload_target)
     try:
+        if _is_runtime_already_running() and not server_changed:
+            _show_already_running_message(server_base, work_dir, grpc_upload_target)
+            return
+        if _is_runtime_already_running() and server_changed and not _is_admin():
+            _show_already_running_message(server_base, work_dir, grpc_upload_target, server_changed=True)
+            return
         if not _is_admin():
             _elevate_for_install(server_base, work_dir, grpc_upload_target)
             return
@@ -898,8 +1164,8 @@ def entrypoint():
             install_server_base = _requested_server_base()
             _install_service(
                 server_base=install_server_base,
-                work_dir=_value_after_flag("--work-dir"),
-                grpc_upload_target=_value_after_flag("--grpc-upload-target") or default_grpc_target(install_server_base),
+                work_dir=_requested_work_dir(),
+                grpc_upload_target=_requested_grpc_target(install_server_base),
                 auto_start=True,
             )
             return
@@ -907,7 +1173,7 @@ def entrypoint():
             _remove_service()
             return
         if command == "start":
-            win32serviceutil.StartService(SERVICE_NAME)
+            _safe_start_service()
             return
         if command == "stop":
             _stop_service_if_exists()

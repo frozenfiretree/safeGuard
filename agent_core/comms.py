@@ -267,11 +267,23 @@ class ServerClient:
         response = self.session.get(
             self._upgrade_download_url(version),
             timeout=max(self.request_timeout, 300),
+            stream=True,
         )
         response.raise_for_status()
         dst.parent.mkdir(parents=True, exist_ok=True)
-        with open(dst, "wb") as handle:
-            handle.write(response.content)
+        tmp = dst.with_suffix(dst.suffix + ".download")
+        try:
+            with open(tmp, "wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+            tmp.replace(dst)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
         return dst
 
     def download_artifact(self, artifact_id: str, dst: Path) -> Path:
